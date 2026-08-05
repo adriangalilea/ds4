@@ -306,6 +306,7 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
 int ds4_engine_model_id(ds4_engine *e);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
 bool ds4_engine_is_glm53(ds4_engine *e);
+uint64_t ds4_engine_checkpoint_fixed_overhead_bytes(ds4_engine *e, int ctx_size);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 int ds4_think_mode_level(ds4_think_mode mode);
