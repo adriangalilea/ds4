@@ -279,6 +279,25 @@ kernel void kernel_mul_mv_q8_0_f32_v4(
     kernel_mul_mv_q8_0_f32_v4_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+// NR0=8 instantiation: eight adjacent output rows per threadgroup instead of
+// two.  Per row the lane mapping, k-walk and reduction tree are identical to
+// the NR0=2 kernel (NR0 only groups more rows per threadgroup), so outputs
+// are bit-identical.  The experiment: fewer, fatter, contiguous row streams
+// per threadgroup against the ~330 GB/s single-token matvec ceiling that
+// neither wider loads nor more simdgroups moved.
+[[host_name("kernel_mul_mv_q8_0_f32_nr8")]]
+kernel void kernel_mul_mv_q8_0_f32_nr8(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_impl<8, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
 // Decode-time Q8_0 matrix-vector multiply. DS4 uses this for Q8_0 dense
 // projections such as shared experts and output-side small matvecs.
 [[host_name("kernel_mul_mv_q8_0_f32")]]
