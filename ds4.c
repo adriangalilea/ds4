@@ -15377,8 +15377,27 @@ DS4_GPU_GRAPH_CLASS_P_ACCESSOR(attn_comp_stage)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(indexer_q)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(indexer_weights)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(indexer_scores)
-DS4_GPU_GRAPH_CLASS_P_ACCESSOR(comp_mask)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(comp_selected)
+
+/* comp_mask is allocated lazily: at comp_cap x prefill_cap floats it is the
+ * same multi-GiB footprint as indexer_scores (4.29 GiB per tier at 1M ctx /
+ * 4096 chunk), but the batched ratio-4 prefill path never touches it — the
+ * indexed attend consumes the top-k list directly.  Only the per-token
+ * fallback, dense decode masking and the CUDA tensor-parallel output path
+ * use the mask, so those pay for it on first touch instead of every server
+ * paying at startup. */
+static ds4_gpu_tensor *metal_graph_ensure_comp_mask_on(ds4_gpu_graph *g, int t) {
+    if (!g->comp_mask_by_tier[t]) {
+        g->comp_mask_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(
+                t, (uint64_t)g->comp_cap * g->prefill_cap * sizeof(float));
+    }
+    return g->comp_mask_by_tier[t];
+}
+
+static inline ds4_gpu_tensor *metal_graph_comp_mask(ds4_gpu_graph *g) {
+    return metal_graph_ensure_comp_mask_on(g, g->active_tier);
+}
+
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(heads)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(attn_low)
 DS4_GPU_GRAPH_CLASS_P_ACCESSOR(attn_out)
@@ -17206,7 +17225,8 @@ static bool metal_graph_alloc_raw_cap(
         g->indexer_q_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, indexer_q_dim * sizeof(float));
         g->indexer_weights_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)DS4_N_INDEXER_HEAD * sizeof(float));
         g->indexer_scores_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)g->comp_cap * pc * sizeof(float));
-        g->comp_mask_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, (uint64_t)g->comp_cap * pc * sizeof(float));
+        /* comp_mask_by_tier: lazily allocated on first touch, see
+         * metal_graph_ensure_comp_mask_on. */
         g->comp_selected_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t,
                 (uint64_t)(DS4_N_INDEXER_TOP_K ? DS4_N_INDEXER_TOP_K : 1u) * pc * sizeof(uint32_t));
         g->heads_by_tier[t] = ds4_gpu_tensor_alloc_ptr_on(t, q_dim * sizeof(float));
@@ -17439,7 +17459,7 @@ static bool metal_graph_alloc_raw_cap(
             g->index_comp_kv_cur_by_tier[t] && g->index_comp_sc_cur_by_tier[t] &&
             (!DS4_GPU_ATTN_COMP_CACHE_F16 || g->attn_comp_stage_by_tier[t]) &&
             g->indexer_q_by_tier[t] && g->indexer_weights_by_tier[t] && g->indexer_scores_by_tier[t] &&
-            g->comp_mask_by_tier[t] && g->comp_selected_by_tier[t] &&
+            g->comp_selected_by_tier[t] &&
             g->heads_by_tier[t] && g->attn_low_by_tier[t] && g->attn_out_by_tier[t] &&
             g->after_attn_hc_by_tier[t] && g->ffn_cur_by_tier[t] && g->ffn_norm_by_tier[t] &&
             g->shared_gate_by_tier[t] && g->shared_up_by_tier[t] && g->shared_mid_by_tier[t] &&
@@ -25308,7 +25328,7 @@ static bool metal_graph_encode_output_head_split_top1(
             !g->output_norm_by_tier[t] ||
             !g->logits_by_tier[t] ||
             !g->comp_selected_by_tier[t] ||
-            !g->comp_mask_by_tier[t]) {
+            !metal_graph_ensure_comp_mask_on(g, t)) {
             return false;
         }
     }
