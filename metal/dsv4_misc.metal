@@ -5729,26 +5729,22 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_mma(
     const uint head0 = tgpig.y * NH;
     if (token >= args.n_tokens || head0 >= args.n_head) return;
 
-    // TG layout: q8 half[8][512] | kv8 half[8][512] | partial f32[8][8][8]
-    //            | pf half[8][8] | diag f32[8][8] | M,S,ms f32[8] each
-    threadgroup half  *q8   = (threadgroup half *)shared;
-    threadgroup half  *kv8  = q8 + NH*D;
-    threadgroup float *part = (threadgroup float *)(kv8 + RB*D); // [8][64]
-    threadgroup half  *pf   = (threadgroup half *)(part + 8*64); // hi/lo [2][8][8]
+    // TG layout (residency diet, ~9.3 KB): kv8 half[RB][512] | scores
+    // f32[8][8] | pf half hi/lo | diag f32[8][8] | M,S,ms f32[8] each.
+    // Q never enters threadgroup memory: the host packs it to half in
+    // device scratch once per call and the score MMA loads it directly.
+    threadgroup half  *kv8  = (threadgroup half *)shared;
+    threadgroup float *psc  = (threadgroup float *)(kv8 + RB*D); // [8][8] tile
+    threadgroup half  *pf   = (threadgroup half *)(psc + 64);    // hi/lo [2][8][8]
     threadgroup float *diag = (threadgroup float *)(pf + 128);   // [8][8]
     threadgroup float *Mh   = diag + 64;                         // [8]
     threadgroup float *Sh   = Mh + NH;                           // [8]
     threadgroup float *msh  = Sh + NH;                           // [8]
 
-    // stage Q for the head group once, with the scalar kernel's rounding
-    for (uint i = tid; i < NH*D; i += NT) {
-        const uint hh = i / D;
-        const uint d = i - hh*D;
-        device const float *qs = (device const float *)(q +
-            (uint64_t)token * args.q_token_stride +
-            (uint64_t)(head0 + hh) * args.q_head_stride);
-        q8[i] = (half)qs[d];
-    }
+    // device half-packed Q for this token's head group (packed by the host
+    // with the same (half) rounding the scalar kernel applies at staging)
+    device const half *q16h = (device const half *)q +
+        ((uint64_t)token * args.n_head + head0) * D;
     // zero the score/softmax scratch and init M/S; kv8 must start finite
     // (pad tile rows are staged-over lazily, and 0 x NaN would poison the
     // accumulators through the zeroed P columns)
@@ -5835,33 +5831,31 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_mma(
 
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // partial score tile: this SG's 64-dim slice of the dot
-            {
+            // full score tile, computed by SG 0 alone (the redundant-per-SG
+            // and partial-split forms both measured worse: TG traffic and
+            // an extra barrier cost more than seven idle SGs for 16 MMAs)
+            if (sg == 0) {
                 simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>(0.0f);
-                for (uint db = 0; db < 8u; db++) {
+                for (uint db = 0; db < D/8u; db++) {
                     simdgroup_half8x8 mq;
                     simdgroup_half8x8 mk;
-                    simdgroup_load(mq, q8 + (uint)sg*64u + db*8u, D, 0, false);
-                    simdgroup_load(mk, kv8 + (uint)sg*64u + db*8u, D, 0, true);
+                    simdgroup_load(mq, q16h + db*8u, D, 0, false);
+                    simdgroup_load(mk, kv8 + db*8u, D, 0, true);
                     simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
                 }
-                simdgroup_store(mqk, part + (uint)sg*64u, 8u, 0, false);
+                simdgroup_store(mqk, psc, 8u, 0, false);
             }
 
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // reduce partials, block-max online softmax (one thread per head)
+            // block-max online softmax (one thread per head)
             if (tid < NH) {
                 const uint hh = (uint)tid;
                 float s_row[RB];
                 float blk_max = -FLT_MAX/2.0f;
                 for (uint r = 0; r < RB; r++) {
                     if (r < n_rows) {
-                        float v = 0.0f;
-                        for (uint p = 0; p < 8u; p++) {
-                            v += part[p*64u + hh*8u + r];
-                        }
-                        v *= args.scale;
+                        const float v = psc[hh*8u + r] * args.scale;
                         s_row[r] = v;
                         blk_max = max(blk_max, v);
                     } else {

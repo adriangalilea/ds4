@@ -351,6 +351,8 @@ static id<MTLBuffer> g_router_weight_sum_buffer;
 static id<MTLBuffer> g_indexer_head_scores_buffer;
 static id<MTLBuffer> g_indexer_topk_buffer;
 static id<MTLBuffer> g_indexed_topk_buffer;
+static id<MTLBuffer> g_attend_q16_buffer;
+static NSUInteger    g_attend_q16_bytes;
 static id<MTLBuffer> g_indexer_q16_buffer;
 static NSUInteger    g_indexer_q16_bytes;
 static id<MTLBuffer> g_indexer_k16_buffer;
@@ -28873,10 +28875,35 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                  threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
         } else {
+            if (prefill_mma) {
+                /* Pack Q to half once per call (same rounding the scalar
+                 * kernel applies at staging); the score MMA loads it
+                 * directly from device so Q never occupies threadgroup
+                 * memory — the 18 KB footprint was the measured cause of
+                 * the first heads8_mma regression. */
+                const NSUInteger q16_bytes =
+                    (NSUInteger)n_tokens * n_head * head_dim * sizeof(uint16_t);
+                if (!ds4_gpu_ensure_scratch_buffer(&g_attend_q16_buffer,
+                                                     &g_attend_q16_bytes,
+                                                     q16_bytes,
+                                                     "ds4_attend_q16") ||
+                    !ds4_gpu_encode_cpy_f32_f16_1d(cb,
+                                                     qbuf,
+                                                     ds4_gpu_tensor_offset(q),
+                                                     g_attend_q16_buffer,
+                                                     0,
+                                                     n_tokens * n_head * head_dim)) {
+                    return 0;
+                }
+            }
             enc = ds4_gpu_compute_encoder(cb);
             [enc setComputePipelineState:attn_pipeline];
             [enc setBytes:&attn_args length:sizeof(attn_args) atIndex:0];
-            [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:1];
+            if (prefill_mma) {
+                [enc setBuffer:g_attend_q16_buffer offset:0 atIndex:1];
+            } else {
+                [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:1];
+            }
             [enc setBuffer:rawbuf offset:ds4_gpu_tensor_offset(raw_kv) atIndex:2];
             [enc setBuffer:compbuf offset:ds4_gpu_tensor_offset(comp_kv) atIndex:3];
             [enc setBuffer:skip_decode_sort ? topkbuf : g_indexed_topk_buffer
@@ -28885,9 +28912,9 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             [enc setBuffer:sinks_buf offset:(NSUInteger)sinks_inner atIndex:5];
             [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:6];
             [enc setThreadgroupMemoryLength:(prefill_mma
-                    /* q8 + kv8 halves, partial tiles, P, diag, M/S/ms */
-                    ? (8u*512u + 8u*512u) * sizeof(uint16_t) +
-                      (8u*64u + 64u + 24u) * sizeof(float) + 128u * sizeof(uint16_t)
+                    /* kv8 halves + score tile, P, diag, M/S/ms */
+                    ? 8u*512u * sizeof(uint16_t) +
+                      (64u + 64u + 24u) * sizeof(float) + 128u * sizeof(uint16_t)
                     : (decode_one_token ? 16u : 1u) *
                       128u * 4u * sizeof(uint16_t))
                                     atIndex:0];
