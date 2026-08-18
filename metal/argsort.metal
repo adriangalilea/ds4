@@ -42,7 +42,7 @@ typedef void (argsort_t)(
 
 // Sort one float row into an index row. DS4 only exports the descending
 // instance because router and indexer selection both need top-k order.
-template<ds4_sort_order order>
+template<ds4_sort_order order, bool canon = false>
 kernel void kernel_argsort_f32_i32(
         constant   ds4_metal_args_argsort & args,
         device   const char * src0,
@@ -80,19 +80,29 @@ kernel void kernel_argsort_f32_i32(
         for (int j = k / 2; j > 0; j /= 2) {
             int ixj = col ^ j;
             if (ixj > col) {
+                /* canon: equal scores tie-break on the index (ascending), so
+                 * the permutation is a total order over (score, idx) — the
+                 * prerequisite for comparing against, or replacing with, any
+                 * streaming/partial top-k whose comparator is totally
+                 * ordered.  The merge kernel is already canonical (left run
+                 * first on ties = index-ascending across runs). */
+                const int32_t ia = shmem_i32[col];
+                const int32_t ib_ = shmem_i32[ixj];
+                const float va = ia < args.ne00 ? shmem_f32[ia - i00] : 0.0f;
+                const float vb = ib_ < args.ne00 ? shmem_f32[ib_ - i00] : 0.0f;
                 if ((col & k) == 0) {
-                    if (shmem_i32[col] >= args.ne00 ||
-                       (shmem_i32[ixj] <  args.ne00 && (order == DS4_SORT_ORDER_ASC ?
-                            shmem_f32[shmem_i32[col] - i00] > shmem_f32[shmem_i32[ixj] - i00] :
-                            shmem_f32[shmem_i32[col] - i00] < shmem_f32[shmem_i32[ixj] - i00]))
+                    if (ia >= args.ne00 ||
+                       (ib_ <  args.ne00 && (order == DS4_SORT_ORDER_ASC ?
+                            (va > vb || (canon && va == vb && ia > ib_)) :
+                            (va < vb || (canon && va == vb && ia > ib_))))
                     ) {
                         SWAP(shmem_i32[col], shmem_i32[ixj]);
                     }
                 } else {
-                    if (shmem_i32[ixj] >= args.ne00 ||
-                       (shmem_i32[col] <  args.ne00 && (order == DS4_SORT_ORDER_ASC ?
-                            shmem_f32[shmem_i32[col] - i00] < shmem_f32[shmem_i32[ixj] - i00] :
-                            shmem_f32[shmem_i32[col] - i00] > shmem_f32[shmem_i32[ixj] - i00]))
+                    if (ib_ >= args.ne00 ||
+                       (ia <  args.ne00 && (order == DS4_SORT_ORDER_ASC ?
+                            (va < vb || (canon && va == vb && ia < ib_)) :
+                            (va > vb || (canon && va == vb && ia < ib_))))
                     ) {
                         SWAP(shmem_i32[col], shmem_i32[ixj]);
                     }
@@ -115,6 +125,9 @@ kernel void kernel_argsort_f32_i32(
 
 // Host-visible sort variant used by DS4 top-k selection.
 template [[host_name("kernel_argsort_f32_i32_desc")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC>;
+// Canonical total order over (score desc, idx asc); tie order among equal
+// scores is the only difference from the kernel above.
+template [[host_name("kernel_argsort_f32_i32_desc_canon")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC, true>;
 
 typedef void (argsort_merge_t)(
         constant   ds4_metal_args_argsort_merge & args,
