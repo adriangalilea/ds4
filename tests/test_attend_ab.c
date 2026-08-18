@@ -140,11 +140,12 @@ static errstat compare(const float *a, const float *ref, size_t n) {
 int main(void) {
     CHECK(ds4_gpu_init(), "gpu init");
 
-    const uint32_t n_tokens = 48u, pos0 = 4000u;
-    const uint32_t n_raw = 128u, raw_cap = 128u, raw_start = 17u;
-    const uint32_t n_comp = 1024u, top_k = 512u;
+    #define ENVU(name, dflt) (getenv(name) ? (uint32_t)strtoul(getenv(name), NULL, 10) : (dflt))
+    const uint32_t n_tokens = ENVU("T", 48u), pos0 = ENVU("P0", 4000u);
+    const uint32_t n_raw = ENVU("NRAW", 128u), raw_cap = n_raw, raw_start = ENVU("RSTART", 17u) % n_raw;
+    const uint32_t n_comp = 1024u, top_k = ENVU("TOPK", 512u);
     const uint32_t window = 128u, ratio = 4u;
-    const uint32_t n_head = 64u, head_dim = 512u;
+    const uint32_t n_head = ENVU("NH", 64u), head_dim = 512u;
 
     const size_t qc = (size_t)n_tokens * n_head * head_dim;
     const size_t rawc = (size_t)raw_cap * head_dim;
@@ -171,6 +172,7 @@ int main(void) {
         for (uint32_t i = 0; i < top_k; i++) {
             int32_t v = (int32_t)((uint32_t)rand() % n_comp);
             if ((i % 37u) == 5u) v = -1;
+            if (getenv("NO_TOPK")) v = -1;
             htk[(size_t)t * top_k + i] = v;
             (void)visible;
         }
@@ -216,6 +218,10 @@ int main(void) {
                 "%s vs cpu-ref: max_rel=%.3e rms_rel=%.3e worst_abs=%.3e\n",
                 pass == 0 ? "baseline " : "candidate", e.max_rel, e.rms,
                 e.worst_abs);
+        if (getenv("DUMP")) {
+            for (uint32_t i = 0; i < 8u; i++)
+                fprintf(stderr, "  [%u] got=%.6f ref=%.6f\n", i, got[i], ref[i]);
+        }
     }
     ds4_gpu_cleanup();
     return 0;

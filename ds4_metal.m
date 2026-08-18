@@ -28721,6 +28721,22 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         const uint32_t decode_splits =
             decode_one_token && !g_quality_mode ? 12u : 1u;
         const bool split_decode = decode_splits > 1u;
+        /* Candidate: MMA-scored prefill attend (quality-gated, not
+         * bit-exact: block softmax + MMA dot reduction).  Opt-in env, read
+         * per call. */
+        const bool prefill_mma = !decode_one_token && !split_decode &&
+            !prefill_dual_heads && !g_quality_mode && (n_head % 8u) == 0u &&
+            head_dim == 512u &&
+            getenv("DS4_METAL_ATTEND_MMA") != NULL;
+        if (prefill_mma) {
+            static int logged_attend_mma;
+            if (!logged_attend_mma) {
+                logged_attend_mma = 1;
+                fprintf(stderr,
+                        "ds4: metal indexed attention prefill using heads8_mma "
+                        "(block softmax, quality-gated)\n");
+            }
+        }
         id<MTLComputePipelineState> attn_pipeline =
             split_decode ?
             ds4_gpu_hot_pipeline(
@@ -28732,6 +28748,8 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             prefill_dual_heads ?
             ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads16_dual_pipeline,
                                    "kernel_dsv4_indexed_mixed_attention_heads16_dual") :
+            prefill_mma ?
+            ds4_gpu_get_pipeline("kernel_dsv4_indexed_mixed_attention_heads8_mma") :
             ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads8_pipeline,
                                    "kernel_dsv4_indexed_mixed_attention_heads8");
         id<MTLComputePipelineState> split_reduce_pipeline = split_decode ?
@@ -28866,8 +28884,12 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                  atIndex:4];
             [enc setBuffer:sinks_buf offset:(NSUInteger)sinks_inner atIndex:5];
             [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:6];
-            [enc setThreadgroupMemoryLength:(decode_one_token ? 16u : 1u) *
-                                            128u * 4u * sizeof(uint16_t)
+            [enc setThreadgroupMemoryLength:(prefill_mma
+                    /* q8 + kv8 halves, partial tiles, P, diag, M/S/ms */
+                    ? (8u*512u + 8u*512u) * sizeof(uint16_t) +
+                      (8u*64u + 64u + 24u) * sizeof(float) + 128u * sizeof(uint16_t)
+                    : (decode_one_token ? 16u : 1u) *
+                      128u * 4u * sizeof(uint16_t))
                                     atIndex:0];
             [enc dispatchThreadgroups:
                     MTLSizeMake((NSUInteger)n_tokens,

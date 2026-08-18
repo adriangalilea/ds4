@@ -5694,6 +5694,255 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads16_dual(
     }
 }
 
+// MMA-scored prefill variant of kernel_dsv4_indexed_mixed_attention_heads8.
+// The scalar kernel is instruction-issue-bound: per (row, head) it spends a
+// 4x dot(half4) + simd_sum shuffle tree plus a per-row softmax update, and
+// three memory-side levers (fetch dedup, barrier batching, staging width)
+// all measured flat.  Here rows are processed in blocks of eight through
+// simdgroup MMA: the 8x8 (head, row) score tile costs sixteen MMAs split
+// across the eight simdgroups, the block-max online softmax runs once per
+// block, and the output accumulators live entirely in simdgroup registers —
+// per-head rescale is a multiply by a diagonal matrix (exact per element:
+// off-diagonal zeros contribute nothing).  Row set, visibility cut, raw
+// window and sink semantics are identical to heads8; the score reduction
+// order and the block softmax are not, so outputs shift at f16-noise scale
+// — this kernel is quality-gated, not bit-exact.
+kernel void kernel_dsv4_indexed_mixed_attention_heads8_mma(
+        constant ds4_metal_args_dsv4_indexed_attention & args,
+        device const char *q,
+        device const char *raw_kv,
+        device const char *comp_kv,
+        device const char *topk,
+        device const char *sinks,
+        device       char *dst,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint NH = 8;    // heads per threadgroup
+    constexpr uint RB = 8;    // rows per block
+    constexpr uint D  = 512;  // head dim
+    constexpr uint NT = 256;
+
+    const uint token = tgpig.x;
+    const uint head0 = tgpig.y * NH;
+    if (token >= args.n_tokens || head0 >= args.n_head) return;
+
+    // TG layout: q8 half[8][512] | kv8 half[8][512] | partial f32[8][8][8]
+    //            | pf half[8][8] | diag f32[8][8] | M,S,ms f32[8] each
+    threadgroup half  *q8   = (threadgroup half *)shared;
+    threadgroup half  *kv8  = q8 + NH*D;
+    threadgroup float *part = (threadgroup float *)(kv8 + RB*D); // [8][64]
+    threadgroup half  *pf   = (threadgroup half *)(part + 8*64); // hi/lo [2][8][8]
+    threadgroup float *diag = (threadgroup float *)(pf + 128);   // [8][8]
+    threadgroup float *Mh   = diag + 64;                         // [8]
+    threadgroup float *Sh   = Mh + NH;                           // [8]
+    threadgroup float *msh  = Sh + NH;                           // [8]
+
+    // stage Q for the head group once, with the scalar kernel's rounding
+    for (uint i = tid; i < NH*D; i += NT) {
+        const uint hh = i / D;
+        const uint d = i - hh*D;
+        device const float *qs = (device const float *)(q +
+            (uint64_t)token * args.q_token_stride +
+            (uint64_t)(head0 + hh) * args.q_head_stride);
+        q8[i] = (half)qs[d];
+    }
+    // zero the score/softmax scratch and init M/S; kv8 must start finite
+    // (pad tile rows are staged-over lazily, and 0 x NaN would poison the
+    // accumulators through the zeroed P columns)
+    for (uint i = tid; i < RB*D; i += NT) {
+        kv8[i] = half(0.0f);
+    }
+    for (uint i = tid; i < 128u; i += NT) {
+        pf[i] = half(0.0f);
+        if (i < 64u) diag[i] = 0.0f;
+    }
+    if (tid < NH) {
+        Mh[tid] = -FLT_MAX/2.0f;
+        Sh[tid] = 0.0f;
+        msh[tid] = 1.0f;
+    }
+
+    // per-SG output accumulators: this SG owns dims [sg*64, sg*64+64)
+    simdgroup_float8x8 o[8];
+    for (uint i = 0; i < 8; i++) {
+        o[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint qpos = args.pos0 + token;
+    const uint last_pos = args.pos0 + args.n_tokens - 1u;
+    const uint first_raw_pos = last_pos + 1u - args.n_raw;
+    const uint raw_last_pos = first_raw_pos + args.n_raw - 1u;
+    const uint window_first = (args.window != 0u && qpos + 1u > args.window) ?
+        qpos + 1u - args.window : 0u;
+    const uint first = max(first_raw_pos, window_first);
+    const uint last = min(qpos, raw_last_pos);
+
+    const uint visible = min((qpos + 1u)/args.ratio, args.n_comp);
+    device const int32_t *row_topk = (device const int32_t *)(topk +
+        (uint64_t)token*args.topk_token_stride);
+
+    // two phases share one block routine: raw window rows then top-k rows
+    const uint n_raw_rows = first <= last ? last - first + 1u : 0u;
+    bool stop = false;
+    for (uint phase = 0; phase < 2u; phase++) {
+        const uint total = phase == 0 ? n_raw_rows : args.top_k;
+        for (uint base = 0; base < total && !stop; base += RB) {
+            // collect this block's source rows (all threads, redundantly)
+            uint rows[RB];
+            uint n_rows = 0;
+            if (phase == 0) {
+                const uint lim = min(RB, total - base);
+                for (uint j = 0; j < lim; j++) {
+                    const uint logical = first + base + j - first_raw_pos;
+                    rows[n_rows++] = (args.raw_start + logical)%args.raw_cap;
+                }
+            } else {
+                for (uint j = 0; j < RB && base + j < total; j++) {
+                    const int32_t idx = row_topk[base + j];
+                    if (idx < 0) continue;
+                    if ((uint)idx >= visible) { stop = true; break; }
+                    rows[n_rows++] = (uint)idx;
+                }
+                if (n_rows == 0) continue;
+            }
+
+            // stage the valid rows (invalid tile rows read stale kv8 halves;
+            // their P columns are forced to zero below, and staged halves are
+            // always finite, so they contribute exactly nothing)
+            for (uint off = (uint)tid; off < n_rows * (D/4u); off += NT) {
+                const uint r = off / (D/4u);
+                const uint c = off - r*(D/4u);
+                threadgroup half4 *dstv = (threadgroup half4 *)kv8;
+                if (phase == 0) {
+                    device const float4 *src = (device const float4 *)(raw_kv +
+                        (uint64_t)rows[r]*args.raw_row_stride);
+                    dstv[r*(D/4u) + c] = (half4)src[c];
+                } else if (args.comp_kv_f16 != 0u) {
+                    device const half4 *src = (device const half4 *)(comp_kv +
+                        (uint64_t)rows[r]*args.comp_row_stride);
+                    dstv[r*(D/4u) + c] = src[c];
+                } else {
+                    device const float4 *src = (device const float4 *)(comp_kv +
+                        (uint64_t)rows[r]*args.comp_row_stride);
+                    dstv[r*(D/4u) + c] = (half4)src[c];
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // partial score tile: this SG's 64-dim slice of the dot
+            {
+                simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>(0.0f);
+                for (uint db = 0; db < 8u; db++) {
+                    simdgroup_half8x8 mq;
+                    simdgroup_half8x8 mk;
+                    simdgroup_load(mq, q8 + (uint)sg*64u + db*8u, D, 0, false);
+                    simdgroup_load(mk, kv8 + (uint)sg*64u + db*8u, D, 0, true);
+                    simdgroup_multiply_accumulate(mqk, mq, mk, mqk);
+                }
+                simdgroup_store(mqk, part + (uint)sg*64u, 8u, 0, false);
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // reduce partials, block-max online softmax (one thread per head)
+            if (tid < NH) {
+                const uint hh = (uint)tid;
+                float s_row[RB];
+                float blk_max = -FLT_MAX/2.0f;
+                for (uint r = 0; r < RB; r++) {
+                    if (r < n_rows) {
+                        float v = 0.0f;
+                        for (uint p = 0; p < 8u; p++) {
+                            v += part[p*64u + hh*8u + r];
+                        }
+                        v *= args.scale;
+                        s_row[r] = v;
+                        blk_max = max(blk_max, v);
+                    } else {
+                        s_row[r] = -FLT_MAX/2.0f;
+                    }
+                }
+                const float old_m = Mh[hh];
+                const float new_m = max(old_m, blk_max);
+                const float ms = exp(old_m - new_m);
+                float s_add = 0.0f;
+                for (uint r = 0; r < RB; r++) {
+                    const float pr = r < n_rows ? exp(s_row[r] - new_m) : 0.0f;
+                    /* split into hi+lo halves so the P x V MMA keeps ~half^2
+                     * precision on the attention weights */
+                    const half hi = (half)pr;
+                    pf[hh*8u + r] = hi;
+                    pf[64u + hh*8u + r] = (half)(pr - (float)hi);
+                    s_add += pr;
+                }
+                Sh[hh] = Sh[hh]*ms + s_add;
+                Mh[hh] = new_m;
+                msh[hh] = ms;
+                diag[hh*8u + hh] = ms;
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // rescale o by diag(ms), then o += P x V for this SG's dims
+            {
+                simdgroup_float8x8 mdiag;
+                simdgroup_load(mdiag, diag, 8u, 0, false);
+                simdgroup_half8x8 mp_hi;
+                simdgroup_half8x8 mp_lo;
+                simdgroup_load(mp_hi, pf, 8u, 0, false);
+                simdgroup_load(mp_lo, pf + 64u, 8u, 0, false);
+                for (uint i = 0; i < 8; i++) {
+                    simdgroup_float8x8 scaled = make_filled_simdgroup_matrix<float, 8>(0.0f);
+                    simdgroup_multiply_accumulate(scaled, mdiag, o[i], scaled);
+                    o[i] = scaled;
+                    simdgroup_half8x8 mv;
+                    simdgroup_load(mv, kv8 + (uint)sg*64u + i*8u, D, 0, false);
+                    simdgroup_multiply_accumulate(o[i], mp_hi, mv, o[i]);
+                    simdgroup_multiply_accumulate(o[i], mp_lo, mv, o[i]);
+                }
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    // attention sink: M/S update only, then fold the final rescale and the
+    // 1/S normalization into one diagonal factor
+    if (tid < NH) {
+        const uint hh = (uint)tid;
+        const float score = ((device const float *)sinks)[head0 + hh];
+        const float old_m = Mh[hh];
+        const float new_m = max(old_m, score);
+        const float ms = exp(old_m - new_m);
+        const float row_scale = exp(score - new_m);
+        const float S = Sh[hh]*ms + row_scale;
+        const float inv_s = S == 0.0f ? 0.0f : 1.0f/S;
+        diag[hh*8u + hh] = ms * inv_s;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    {
+        simdgroup_float8x8 mdiag;
+        simdgroup_load(mdiag, diag, 8u, 0, false);
+        device float *out = (device float *)(dst +
+            (uint64_t)token*args.dst_token_stride +
+            (uint64_t)head0*args.dst_head_stride);
+        for (uint i = 0; i < 8; i++) {
+            simdgroup_float8x8 fin = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            simdgroup_multiply_accumulate(fin, mdiag, o[i], fin);
+            simdgroup_store(fin, out + (uint)sg*64u + i*8u,
+                            args.dst_head_stride / sizeof(float), 0, false);
+        }
+    }
+}
+
 // Decode specialization of kernel_dsv4_indexed_mixed_attention_heads8.
 // Generation attends one token at a time, so the ratio-4 indexed path spends a
 // visible amount of time repeatedly staging the same K/V row for the eight
