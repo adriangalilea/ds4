@@ -17576,20 +17576,26 @@ static int ds4_gpu_indexer_scores_batch_tensor(
          * outputs. */
         const bool use_tiled4 = use_tiled2 &&
             getenv("DS4_METAL_INDEXER_SCORES_TILED4") != NULL;
+        /* Candidate on top of tiled4: K tiles resident in simdgroup
+         * registers across the head loop.  Opt-in env, read per call. */
+        const bool use_tiled5 = use_tiled2 &&
+            getenv("DS4_METAL_INDEXER_SCORES_TILED5") != NULL;
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
             use_nax ? "kernel_dsv4_indexer_scores_nax" :
             (g_quality_mode ? "kernel_dsv4_indexer_scores_tiled_f32" :
-             (use_tiled4 ? "kernel_dsv4_indexer_scores_tiled4_f16" :
-              (use_tiled2 ? "kernel_dsv4_indexer_scores_tiled2_f16"
-                          : "kernel_dsv4_indexer_scores_tiled"))));
+             (use_tiled5 ? "kernel_dsv4_indexer_scores_tiled5_f16" :
+              (use_tiled4 ? "kernel_dsv4_indexer_scores_tiled4_f16" :
+               (use_tiled2 ? "kernel_dsv4_indexer_scores_tiled2_f16"
+                           : "kernel_dsv4_indexer_scores_tiled")))));
         if (!pipeline) return 0;
-        if (use_tiled4) {
-            static int logged_tiled4;
-            if (!logged_tiled4) {
-                logged_tiled4 = 1;
+        if (use_tiled4 || use_tiled5) {
+            static int logged_tiled45;
+            if (!logged_tiled45) {
+                logged_tiled45 = 1;
                 fprintf(stderr,
-                        "ds4: metal indexer prefill scorer using tiled4 "
-                        "(register-blocked TM=16)\n");
+                        "ds4: metal indexer prefill scorer using %s\n",
+                        use_tiled5 ? "tiled5 (K-register-resident TM=16)"
+                                   : "tiled4 (register-blocked TM=16)");
             }
         }
         if (use_tiled2) {
@@ -17681,7 +17687,7 @@ static int ds4_gpu_indexer_scores_batch_tensor(
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
         } else if (use_tiled2) {
-            const NSUInteger tm = use_tiled4 ? 16u : 8u;
+            const NSUInteger tm = (use_tiled4 || use_tiled5) ? 16u : 8u;
             const NSUInteger q_shared = tm * 128u;
             const NSUInteger k_shared = 64u * 128u;
             const NSUInteger dot_shared = tm * 64u;
