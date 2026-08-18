@@ -28912,9 +28912,9 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             [enc setBuffer:sinks_buf offset:(NSUInteger)sinks_inner atIndex:5];
             [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:6];
             [enc setThreadgroupMemoryLength:(prefill_mma
-                    /* kv8 halves + score tile, P, diag, M/S/ms */
+                    /* kv8 halves + partial tiles, P, diag, M/S/ms */
                     ? 8u*512u * sizeof(uint16_t) +
-                      (64u + 64u + 24u) * sizeof(float) + 128u * sizeof(uint16_t)
+                      (8u*64u + 64u + 24u) * sizeof(float) + 128u * sizeof(uint16_t)
                     : (decode_one_token ? 16u : 1u) *
                       128u * 4u * sizeof(uint16_t))
                                     atIndex:0];
