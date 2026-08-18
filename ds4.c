@@ -30763,6 +30763,7 @@ static bool metal_graph_eval_token_raw_swa_streaming(
                 (t_read - t0) * 1000.0,
                 logits != NULL);
     }
+    if (metal_graph_gpu_stage_timestamps()) ds4_gpu_stage_report("decode", pos, 1);
     if (ok) graph_power_note_decode_token(g, t_read - t0);
     if (!ok) {
         if (ds4_gpu_synchronize() == 0) {
@@ -30815,6 +30816,7 @@ static bool metal_graph_eval_token_raw_swa(
                 (t_read - t0) * 1000.0,
                 logits != NULL);
     }
+    if (metal_graph_gpu_stage_timestamps()) ds4_gpu_stage_report("decode", pos, 1);
     if (ok) graph_power_note_decode_token(g, t_read - t0);
     if (!ok) {
         if (ds4_gpu_synchronize() == 0) {
