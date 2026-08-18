@@ -17573,14 +17573,20 @@ static int ds4_gpu_indexer_scores_batch_tensor(
         /* Candidate: head-batched direct-load scorer (tiled3).  Opt-in env,
          * read per call for the ABBA variant bench.  Same packed inputs and
          * accumulation order as tiled2 — bit-identical outputs. */
+        const char *tiled3_env = getenv("DS4_METAL_INDEXER_SCORES_TILED3");
         const bool use_tiled3 = use_tiled2 && (n_head % 8u) == 0u &&
-            getenv("DS4_METAL_INDEXER_SCORES_TILED3") != NULL;
+            tiled3_env != NULL;
+        /* "8" selects the HB=8 head-batched kernel (known ULP drift from
+         * fast-math reassociation of the apply chain); anything else gets
+         * the bit-exact direct-load variant. */
+        const bool use_tiled3b = use_tiled3 && tiled3_env[0] != '8';
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
             use_nax ? "kernel_dsv4_indexer_scores_nax" :
             (g_quality_mode ? "kernel_dsv4_indexer_scores_tiled_f32" :
-             (use_tiled3 ? "kernel_dsv4_indexer_scores_tiled3_f16" :
-              (use_tiled2 ? "kernel_dsv4_indexer_scores_tiled2_f16"
-                          : "kernel_dsv4_indexer_scores_tiled"))));
+             (use_tiled3b ? "kernel_dsv4_indexer_scores_tiled3b_f16" :
+              (use_tiled3 ? "kernel_dsv4_indexer_scores_tiled3_f16" :
+               (use_tiled2 ? "kernel_dsv4_indexer_scores_tiled2_f16"
+                           : "kernel_dsv4_indexer_scores_tiled")))));
         if (!pipeline) return 0;
         if (use_tiled3) {
             static int logged_tiled3;
