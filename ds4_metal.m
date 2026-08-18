@@ -28627,6 +28627,18 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             !decode_one_token && !g_quality_mode && ds4_gpu_mpp_available() &&
             n_head == 64u &&
             top_k == 512u && window == 128u && head_dim == 512u;
+        /* Pre-M5 prefill: the rb16 kernel stages 16 query rows per pass over
+         * the same row order and online-softmax sequence as heads8, so the
+         * result is bit-identical while the row staging amortises the KV
+         * reads. DS4_METAL_DISABLE_PRE_M5_INDEXED_ATTN_RB16 rolls back. */
+        static int prefill_rb16_default = -1;
+        if (prefill_rb16_default < 0) {
+            prefill_rb16_default =
+                ds4_gpu_device_is_pre_m5_apple_silicon() &&
+                getenv("DS4_METAL_DISABLE_PRE_M5_INDEXED_ATTN_RB16") == NULL;
+        }
+        const bool prefill_rb16 =
+            !decode_one_token && !prefill_dual_heads && prefill_rb16_default != 0;
         const uint32_t decode_splits =
             decode_one_token && !g_quality_mode ? 12u : 1u;
         const bool split_decode = decode_splits > 1u;
@@ -28635,7 +28647,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             ds4_gpu_hot_pipeline(
                 g_dsv4_indexed_attention_heads8_split_pipeline,
                 "kernel_dsv4_indexed_mixed_attention_heads8_split") :
-            decode_one_token ?
+            (decode_one_token || prefill_rb16) ?
             ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads8_rb16_pipeline,
                                    "kernel_dsv4_indexed_mixed_attention_heads8_rb16") :
             prefill_dual_heads ?
@@ -28775,7 +28787,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                  atIndex:4];
             [enc setBuffer:sinks_buf offset:(NSUInteger)sinks_inner atIndex:5];
             [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:6];
-            [enc setThreadgroupMemoryLength:(decode_one_token ? 16u : 1u) *
+            [enc setThreadgroupMemoryLength:((decode_one_token || prefill_rb16) ? 16u : 1u) *
                                             128u * 4u * sizeof(uint16_t)
                                     atIndex:0];
             [enc dispatchThreadgroups:
