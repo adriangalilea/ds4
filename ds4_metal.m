@@ -17947,6 +17947,51 @@ int ds4_gpu_indexer_topk_tensor(
             fprintf(stderr, "ds4: Metal graph indexer top-k received undersized buffers\n");
             return 0;
         }
+        /* Candidate (read per call): exact streaming top-512 — one pass over
+         * the score row with a running 512th-best threshold, in place of the
+         * padded bitonic + merge cascade.  Output list is bit-identical to
+         * the CANON comparator path (same (score desc, idx asc) total
+         * order). */
+        if (top_k == 512u && n_tokens >= 32u &&
+            getenv("DS4_METAL_TOPK_STREAM512") != NULL) {
+            static int logged_stream512;
+            if (!logged_stream512) {
+                logged_stream512 = 1;
+                fprintf(stderr,
+                        "ds4: metal indexer topk using stream512\n");
+            }
+            id<MTLComputePipelineState> stream_pipeline =
+                ds4_gpu_get_pipeline("kernel_dsv4_indexer_topk_stream512");
+            if (!stream_pipeline) return 0;
+            ds4_gpu_kargs_argsort sargs = {
+                .ne00 = (int32_t)n_comp,
+                .ne01 = (int32_t)n_tokens,
+                .ne02 = 1,
+                .ne03 = 1,
+                .nb00 = sizeof(float),
+                .nb01 = (uint64_t)n_comp * sizeof(float),
+                .nb02 = (uint64_t)n_comp * n_tokens * sizeof(float),
+                .nb03 = (uint64_t)n_comp * n_tokens * sizeof(float),
+                .ne0 = (int32_t)top_k,
+                .ne1 = (int32_t)n_tokens,
+                .ne2 = 1,
+                .ne3 = 1,
+                .top_k = (int32_t)top_k,
+            };
+            int owned = 0;
+            id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+            if (!cb) return 0;
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:stream_pipeline];
+            [enc setBytes:&sargs length:sizeof(sargs) atIndex:0];
+            [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:1];
+            [enc setBuffer:selbuf offset:ds4_gpu_tensor_offset(selected) atIndex:2];
+            [enc setThreadgroupMemoryLength:2048u * sizeof(uint64_t) + 96u atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+            return ds4_gpu_finish_command_buffer(cb, owned, "indexer topk stream512");
+        }
         /* Candidate (read per call): canonical (score desc, idx asc) total
          * order — tie order among equal scores is the only output change;
          * prerequisite for streaming top-k. */
