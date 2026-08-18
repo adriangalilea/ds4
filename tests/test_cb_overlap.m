@@ -1,0 +1,163 @@
+/* Decides the bold-path-A stream-split design: can two internally-serial
+ * dependency chains overlap on the GPU when placed in separate command
+ * buffers (single queue, disjoint tracked buffers), and how does that
+ * compare to (a) one serial encoder and (c) one concurrent encoder with a
+ * full barrier per chain step?
+ *
+ *   A: both chains interleaved in ONE serial encoder (today's decode shape)
+ *   B: chain per COMMAND BUFFER, committed together, one wait
+ *   C: both chains in ONE concurrent encoder, memoryBarrier per step
+ *      (measures the full-execution-barrier serialization claim)
+ *   D: chain per CB with UNTRACKED buffers + explicit single wait
+ *
+ * Each chain step is a bandwidth-heavy pass over its own big buffer with a
+ * serial dependency on the previous step's output. If B ~= max(chain) while
+ * A ~= sum, stream-split decode is viable. cc -O2 -o tests/test_cb_overlap
+ * tests/test_cb_overlap.m -framework Metal -framework Foundation */
+#import <Metal/Metal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <mach/mach_time.h>
+
+static const char *SRC =
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"kernel void chain_step(device float *buf [[buffer(0)]],\n"
+"                       device const float *dep [[buffer(1)]],\n"
+"                       device const float *shared_ro [[buffer(3)]],\n"
+"                       device float *out [[buffer(4)]],\n"
+"                       constant uint &n [[buffer(2)]],\n"
+"                       uint gid [[thread_position_in_grid]],\n"
+"                       uint threads [[threads_per_grid]]) {\n"
+"    float acc = dep[gid % 1024u] + shared_ro[gid % 1024u];\n"
+"    for (uint i = gid; i < n; i += threads) acc += buf[i];\n"
+"    out[gid % 1024u] = acc;\n"
+"}\n";
+
+static double ms(uint64_t a, uint64_t b) {
+    static mach_timebase_info_data_t tb;
+    if (!tb.denom) mach_timebase_info(&tb);
+    return (double)(b - a) * tb.numer / tb.denom / 1e6;
+}
+
+int main(int argc, char **argv) {
+    const uint32_t STEPS = argc > 1 ? (uint32_t)atoi(argv[1]) : 8;
+    const uint32_t MB = argc > 2 ? (uint32_t)atoi(argv[2]) : 256;
+    const uint32_t GRID = argc > 3 ? (uint32_t)atoi(argv[3]) : 32768;
+    const uint32_t N = MB * 1024u * 1024u / 4u;
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+    fprintf(stderr, "device %s  steps=%u  buf=%u MB x2 chains  grid=%u\n",
+            dev.name.UTF8String, STEPS, MB, GRID);
+    NSError *err = nil;
+    id<MTLLibrary> lib = [dev newLibraryWithSource:
+        [NSString stringWithUTF8String:SRC] options:nil error:&err];
+    if (!lib) { fprintf(stderr, "compile: %s\n", err.description.UTF8String); return 1; }
+    id<MTLComputePipelineState> pso = [dev newComputePipelineStateWithFunction:
+        [lib newFunctionWithName:@"chain_step"] error:&err];
+    id<MTLCommandQueue> q = [dev newCommandQueue];
+
+    /* one big buffer per chain (read target) + one small dep buffer per chain */
+    id<MTLBuffer> big[2], dep[2];
+    for (int c = 0; c < 2; c++) {
+        big[c] = [dev newBufferWithLength:(NSUInteger)N * 4 options:MTLResourceStorageModeShared];
+        dep[c] = [dev newBufferWithLength:4096 options:MTLResourceStorageModeShared];
+        float *p = big[c].contents;
+        for (uint32_t i = 0; i < N; i += 4096) p[i] = 1.0f;
+    }
+    const MTLSize grid = MTLSizeMake(GRID, 1, 1);
+    const MTLSize tg = MTLSizeMake(256, 1, 1);
+
+    id<MTLBuffer> shared_ro = [dev newBufferWithLength:4096 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> big0 = big[0], big1 = big[1], dep0 = dep[0], dep1 = dep[1];
+    void (^encode_step)(id<MTLComputeCommandEncoder>, int) =
+        ^(id<MTLComputeCommandEncoder> e, int c) {
+            [e setComputePipelineState:pso];
+            [e setBuffer:(c ? big1 : big0) offset:0 atIndex:0];
+            [e setBuffer:(c ? dep1 : dep0) offset:0 atIndex:1];
+            [e setBytes:&N length:4 atIndex:2];
+            [e setBuffer:shared_ro offset:0 atIndex:3];
+            [e setBuffer:(c ? dep1 : dep0) offset:0 atIndex:4];
+            [e dispatchThreads:grid threadsPerThreadgroup:tg];
+        };
+
+    for (int rep = 0; rep < 3; rep++) {
+        /* A: one serial encoder, chains interleaved */
+        uint64_t t0 = mach_absolute_time();
+        id<MTLCommandBuffer> cb = [q commandBuffer];
+        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        for (uint32_t s = 0; s < STEPS; s++) { encode_step(e, 0); encode_step(e, 1); }
+        [e endEncoding];
+        [cb commit]; [cb waitUntilCompleted];
+        double a = ms(t0, mach_absolute_time());
+        double a_gpu = (cb.GPUEndTime - cb.GPUStartTime) * 1e3;
+
+        /* B: one CB per chain, committed together */
+        t0 = mach_absolute_time();
+        id<MTLCommandBuffer> cbs[2];
+        for (int c = 0; c < 2; c++) {
+            cbs[c] = [q commandBuffer];
+            id<MTLComputeCommandEncoder> ec = [cbs[c] computeCommandEncoder];
+            for (uint32_t s = 0; s < STEPS; s++) encode_step(ec, c);
+            [ec endEncoding];
+        }
+        [cbs[0] commit]; [cbs[1] commit];
+        [cbs[1] waitUntilCompleted]; [cbs[0] waitUntilCompleted];
+        double b = ms(t0, mach_absolute_time());
+
+        /* C: one concurrent encoder, full barrier between steps */
+        t0 = mach_absolute_time();
+        cb = [q commandBuffer];
+        e = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+        for (uint32_t s = 0; s < STEPS; s++) {
+            encode_step(e, 0); encode_step(e, 1);
+            id<MTLResource> res[2] = { big0, big1 };
+            if (s + 1 < STEPS) [e memoryBarrierWithResources:res count:2];
+        }
+        [e endEncoding];
+        [cb commit]; [cb waitUntilCompleted];
+        double cc_ = ms(t0, mach_absolute_time());
+
+        /* D: like B but with two queues (upper bound: no queue-level order) */
+        static id<MTLCommandQueue> q2;
+        if (!q2) q2 = [dev newCommandQueue];
+        t0 = mach_absolute_time();
+        id<MTLCommandQueue> qs[2] = { q, q2 };
+        for (int c = 0; c < 2; c++) {
+            cbs[c] = [qs[c] commandBuffer];
+            id<MTLComputeCommandEncoder> ec = [cbs[c] computeCommandEncoder];
+            for (uint32_t s = 0; s < STEPS; s++) encode_step(ec, c);
+            [ec endEncoding];
+        }
+        [cbs[0] commit]; [cbs[1] commit];
+        [cbs[1] waitUntilCompleted]; [cbs[0] waitUntilCompleted];
+        double d = ms(t0, mach_absolute_time());
+
+        /* E: two CBs, write targets are two OFFSETS of one shared buffer
+         * (the arena/suballocation case; tracked hazards are per-resource) */
+        static id<MTLBuffer> arena;
+        if (!arena) arena = [dev newBufferWithLength:8192 options:MTLResourceStorageModeShared];
+        t0 = mach_absolute_time();
+        for (int c = 0; c < 2; c++) {
+            cbs[c] = [q commandBuffer];
+            id<MTLComputeCommandEncoder> ec = [cbs[c] computeCommandEncoder];
+            for (uint32_t s2 = 0; s2 < STEPS; s2++) {
+                [ec setComputePipelineState:pso];
+                [ec setBuffer:(c ? big1 : big0) offset:0 atIndex:0];
+                [ec setBuffer:(c ? dep1 : dep0) offset:0 atIndex:1];
+                [ec setBytes:&N length:4 atIndex:2];
+                [ec setBuffer:shared_ro offset:0 atIndex:3];
+                [ec setBuffer:arena offset:(NSUInteger)c * 4096 atIndex:4];
+                [ec dispatchThreads:grid threadsPerThreadgroup:tg];
+            }
+            [ec endEncoding];
+        }
+        [cbs[0] commit]; [cbs[1] commit];
+        [cbs[1] waitUntilCompleted]; [cbs[0] waitUntilCompleted];
+        double eo = ms(t0, mach_absolute_time());
+
+        fprintf(stderr,
+            "rep%d  A serial-enc %.1f ms (gpu %.1f)  B two-CB %.1f  C conc+barrier %.1f  D two-queue %.1f  E arena-dep %.1f   B/A=%.2f E/A=%.2f\n",
+            rep, a, a_gpu, b, cc_, d, eo, b / a, eo / a);
+    }
+    return 0;
+}
