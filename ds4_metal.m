@@ -17570,17 +17570,43 @@ static int ds4_gpu_indexer_scores_batch_tensor(
         const bool use_tiled2 = !use_nax && !g_quality_mode &&
             n_tokens >= 32u &&
             getenv("DS4_METAL_DISABLE_INDEXER_SCORES_TILED2") == NULL;
+        /* Candidate: head-batched direct-load scorer (tiled3).  Opt-in env,
+         * read per call for the ABBA variant bench.  Same packed inputs and
+         * accumulation order as tiled2 — bit-identical outputs. */
+        const bool use_tiled3 = use_tiled2 && (n_head % 8u) == 0u &&
+            getenv("DS4_METAL_INDEXER_SCORES_TILED3") != NULL;
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
             use_nax ? "kernel_dsv4_indexer_scores_nax" :
             (g_quality_mode ? "kernel_dsv4_indexer_scores_tiled_f32" :
-             (use_tiled2 ? "kernel_dsv4_indexer_scores_tiled2_f16"
-                         : "kernel_dsv4_indexer_scores_tiled")));
+             (use_tiled3 ? "kernel_dsv4_indexer_scores_tiled3_f16" :
+              (use_tiled2 ? "kernel_dsv4_indexer_scores_tiled2_f16"
+                          : "kernel_dsv4_indexer_scores_tiled"))));
         if (!pipeline) return 0;
+        if (use_tiled3) {
+            static int logged_tiled3;
+            if (!logged_tiled3) {
+                logged_tiled3 = 1;
+                fprintf(stderr,
+                        "ds4: metal indexer prefill scorer using tiled3 "
+                        "(head-batched direct-load)\n");
+            }
+        }
         if (use_tiled2) {
+            /* tiled3 loads full 8-token / 64-comp tiles straight from the
+             * packed buffers, so the allocation is rounded up to tile
+             * multiples.  The pad lanes are never zeroed: a dot cell depends
+             * only on its own Q row and K row, so pad garbage cannot reach a
+             * valid output. */
+            const NSUInteger q_rows = use_tiled3
+                ? (((NSUInteger)n_tokens + 7u) & ~(NSUInteger)7u)
+                : (NSUInteger)n_tokens;
+            const NSUInteger k_rows = use_tiled3
+                ? (((NSUInteger)n_comp + 63u) & ~(NSUInteger)63u)
+                : (NSUInteger)n_comp;
             const NSUInteger q16_bytes =
-                (NSUInteger)n_tokens * n_head * head_dim * sizeof(uint16_t);
+                q_rows * n_head * head_dim * sizeof(uint16_t);
             const NSUInteger k16_bytes =
-                (NSUInteger)n_comp * head_dim * sizeof(uint16_t);
+                k_rows * head_dim * sizeof(uint16_t);
             if (!ds4_gpu_ensure_scratch_buffer(&g_indexer_q16_buffer,
                                                  &g_indexer_q16_bytes,
                                                  q16_bytes,
@@ -17668,8 +17694,10 @@ static int ds4_gpu_indexer_scores_batch_tensor(
             const NSUInteger q_shared = 8u * 128u;
             const NSUInteger k_shared = 64u * 128u;
             const NSUInteger dot_shared = 8u * 64u;
-            [enc setThreadgroupMemoryLength:(q_shared + k_shared) * sizeof(uint16_t) +
-                                            dot_shared * sizeof(float) atIndex:0];
+            [enc setThreadgroupMemoryLength:(use_tiled3
+                    ? 8u * 8u * 64u * sizeof(float)
+                    : (q_shared + k_shared) * sizeof(uint16_t) +
+                      dot_shared * sizeof(float)) atIndex:0];
             [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + 63u) / 64u,
                                                   ((NSUInteger)n_tokens + 7u) / 8u,
                                                   1)
