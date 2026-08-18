@@ -996,14 +996,15 @@ static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer>
     if (g_batch_cb && cb == g_batch_cb) {
         g_batch_has_work = YES;
         if (!g_batch_enc) {
-            /* Experiment env, read per call for the ABBA bench: run every
-             * batch encoder with MTLDispatchTypeConcurrent and let tracked
-             * hazards order the dispatches.  Independent weight streams
-             * inside a decode layer (q/kv/router/compressor fed by one norm,
-             * the two HC expands, shared vs routed FFN) may then overlap;
-             * every non-model buffer is hazard-tracked, so ordering stays
-             * correct by construction.  The armed parallel-FFN path composes:
-             * with an encoder already open it reuses it. */
+            /* UNSAFE TIMING PROBE ONLY (measured NOT EXACT 2026-08-19,
+             * logits diverge at the first decoded token): Metal's automatic
+             * hazard tracking orders work at ENCODER boundaries — inside a
+             * concurrent-dispatch encoder there is NO implicit ordering
+             * between dispatches; dependent dispatches need explicit
+             * memoryBarrier calls (which is why the armed parallel-FFN path
+             * places its own level barriers).  Kept because a full-overlap
+             * run bounds the dependency-level design from above: its wall
+             * time is the ceiling of what explicit leveling can reach. */
             const bool concurrent = g_batch_encoder_concurrent ||
                 getenv("DS4_METAL_CONCURRENT_BATCH_ENCODER") != NULL;
             g_batch_enc = concurrent
