@@ -18869,12 +18869,28 @@ static int ds4_gpu_indexer_scores_batch_tensor(
         const bool use_tiled2 = !use_nax && !g_quality_mode &&
             n_tokens >= 32u &&
             getenv("DS4_METAL_DISABLE_INDEXER_SCORES_TILED2") == NULL;
+        /* Candidate: register-blocked TM=16 scorer (tiled4).  Opt-in env,
+         * read per call for the ABBA variant bench.  Same staged values,
+         * barrier structure and accumulation order as tiled2 — bit-identical
+         * outputs. */
+        const bool use_tiled4 = use_tiled2 &&
+            getenv("DS4_METAL_INDEXER_SCORES_TILED4") != NULL;
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
             use_nax ? "kernel_dsv4_indexer_scores_nax" :
             (g_quality_mode ? "kernel_dsv4_indexer_scores_tiled_f32" :
-             (use_tiled2 ? "kernel_dsv4_indexer_scores_tiled2_f16"
-                         : "kernel_dsv4_indexer_scores_tiled")));
+             (use_tiled4 ? "kernel_dsv4_indexer_scores_tiled4_f16" :
+              (use_tiled2 ? "kernel_dsv4_indexer_scores_tiled2_f16"
+                          : "kernel_dsv4_indexer_scores_tiled"))));
         if (!pipeline) return 0;
+        if (use_tiled4) {
+            static int logged_tiled4;
+            if (!logged_tiled4) {
+                logged_tiled4 = 1;
+                fprintf(stderr,
+                        "ds4: metal indexer prefill scorer using tiled4 "
+                        "(register-blocked TM=16)\n");
+            }
+        }
         if (use_tiled2) {
             const NSUInteger q16_bytes =
                 (NSUInteger)n_tokens * n_head * head_dim * sizeof(uint16_t);
@@ -18964,13 +18980,14 @@ static int ds4_gpu_indexer_scores_batch_tensor(
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
         } else if (use_tiled2) {
-            const NSUInteger q_shared = 8u * 128u;
+            const NSUInteger tm = use_tiled4 ? 16u : 8u;
+            const NSUInteger q_shared = tm * 128u;
             const NSUInteger k_shared = 64u * 128u;
-            const NSUInteger dot_shared = 8u * 64u;
+            const NSUInteger dot_shared = tm * 64u;
             [enc setThreadgroupMemoryLength:(q_shared + k_shared) * sizeof(uint16_t) +
                                             dot_shared * sizeof(float) atIndex:0];
             [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + 63u) / 64u,
-                                                  ((NSUInteger)n_tokens + 7u) / 8u,
+                                                  ((NSUInteger)n_tokens + tm - 1u) / tm,
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
         } else {
