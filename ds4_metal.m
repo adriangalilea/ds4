@@ -964,6 +964,34 @@ static id<MTLCommandBuffer> ds4_gpu_command_buffer(int *owned) {
     return cb;
 }
 
+/* DS4_METAL_COMMAND_CENSUS: count the command-stream shape (buffers,
+ * encoders, waits) to attribute decode wall time between GPU work and
+ * submission/synchronization overhead.  Report every 256 waits and at
+ * exit; pure counting, no behavior change. */
+static uint64_t g_census_cbs_created;
+static uint64_t g_census_cbs_committed;
+static uint64_t g_census_waits;
+static uint64_t g_census_encoders;
+static uint64_t g_census_batch_encoder_reuse;
+static int g_census_enabled = -1;
+static void ds4_gpu_census_report(void) {
+    fprintf(stderr,
+            "ds4: command census: cbs created=%llu committed=%llu waits=%llu "
+            "encoders=%llu batch-encoder-reuse=%llu\n",
+            (unsigned long long)g_census_cbs_created,
+            (unsigned long long)g_census_cbs_committed,
+            (unsigned long long)g_census_waits,
+            (unsigned long long)g_census_encoders,
+            (unsigned long long)g_census_batch_encoder_reuse);
+}
+static inline int ds4_gpu_census_on(void) {
+    if (g_census_enabled < 0) {
+        g_census_enabled = getenv("DS4_METAL_COMMAND_CENSUS") != NULL;
+        if (g_census_enabled) atexit(ds4_gpu_census_report);
+    }
+    return g_census_enabled;
+}
+
 static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer> cb) {
     if (g_batch_cb && cb == g_batch_cb) {
         g_batch_has_work = YES;
@@ -971,9 +999,13 @@ static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer>
             g_batch_enc = g_batch_encoder_concurrent
                 ? [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]
                 : [cb computeCommandEncoder];
+            if (ds4_gpu_census_on()) g_census_encoders++;
+        } else if (ds4_gpu_census_on()) {
+            g_census_batch_encoder_reuse++;
         }
         return g_batch_enc;
     }
+    if (ds4_gpu_census_on()) g_census_encoders++;
     return [cb computeCommandEncoder];
 }
 
@@ -992,6 +1024,7 @@ static void ds4_gpu_close_batch_encoder(void) {
 static double g_gpu_busy_accum;
 static uint64_t g_gpu_busy_cbs;
 
+
 /* A failed command buffer can leave a cross-threadgroup arrival counter at an
  * arbitrary partial value.  Drop cached ownership instead of CPU-resetting
  * buffers that another in-flight command buffer might still reference; bound
@@ -1004,6 +1037,10 @@ static void ds4_gpu_invalidate_completion_counters(void) {
 }
 
 static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *label) {
+    if (ds4_gpu_census_on()) {
+        g_census_waits++;
+        if ((g_census_waits % 256u) == 0u) ds4_gpu_census_report();
+    }
     [cb waitUntilCompleted];
     if (getenv("DS4_METAL_GPU_BUSY_PROFILE")) {
         const double busy = cb.GPUEndTime - cb.GPUStartTime;
@@ -1026,6 +1063,7 @@ static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *labe
 static id<MTLCommandBuffer> ds4_gpu_new_command_buffer(void) {
     static int initialized;
     static int use_unretained;
+    if (ds4_gpu_census_on()) g_census_cbs_created++;
     if (!initialized) {
         use_unretained = getenv("DS4_METAL_UNRETAINED_COMMAND_BUFFERS") != NULL;
         initialized = 1;
@@ -1206,6 +1244,7 @@ static int ds4_gpu_wait_pending_command_buffers(const char *label) {
 static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, const char *label) {
     if (!owned) return 1;
 
+    if (ds4_gpu_census_on()) g_census_cbs_committed++;
     [cb commit];
     int ok = ds4_gpu_wait_pending_command_buffers(label);
     if (!ds4_gpu_wait_command_buffer(cb, label)) {
