@@ -67,7 +67,10 @@ int main(void) {
               scale), "tiled2 compute");
     CHECK(ds4_gpu_tensor_read(s, 0, sa, s_count * sizeof(float)), "read a");
 
-    setenv("DS4_METAL_INDEXER_SCORES_TILED4", "1", 1);
+    {
+        const char *cand = getenv("SCORER_CAND_ENV");
+        setenv(cand ? cand : "DS4_METAL_INDEXER_SCORES_TILED4", "1", 1);
+    }
     CHECK(ds4_gpu_indexer_scores_decode_batch_tensor(
               s, q, w, k, n_comp, n_tokens, pos0, n_head, head_dim, ratio,
               scale), "tiled4 compute");
