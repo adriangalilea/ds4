@@ -155,9 +155,81 @@ int main(int argc, char **argv) {
         [cbs[1] waitUntilCompleted]; [cbs[0] waitUntilCompleted];
         double eo = ms(t0, mach_absolute_time());
 
-        fprintf(stderr,
-            "rep%d  A serial-enc %.1f ms (gpu %.1f)  B two-CB %.1f  C conc+barrier %.1f  D two-queue %.1f  E arena-dep %.1f   B/A=%.2f E/A=%.2f\n",
-            rep, a, a_gpu, b, cc_, d, eo, b / a, eo / a);
+        /* F: the decode shape — LAYERS iterations of: main CB runs one BIG
+         * step (q_path), side CB runs SMALL_STEPS small steps (the
+         * kv/compressor/indexer chain), cross-synchronized per layer with
+         * MTLEvents exactly like the planned decode side-stream:
+         *   main:  big(L)                    -> signal e_main(L) ...
+         *   side:  wait e_main(L-1 join)? -- here: side chain of layer L
+         *          depends on nothing from big(L) (models S2 independence
+         *          from q_b), but layer L+1's big depends on side(L)'s
+         *          completion (models attend needing topk):
+         *   main:  big(L) ; wait side_done(L) ; big(L+1) ...
+         *   side:  small*8(L) ; signal side_done(L) ; small*8(L+1) ...
+         * G: same layers/steps but everything serial in one encoder
+         *    (the baseline decode shape). */
+        {
+            const uint32_t LAYERS = 8;
+            const uint32_t SMALL_STEPS = 32;
+            const uint32_t SMALL_GRID = 4096;
+            const uint32_t SMALL_N = 2u * 1024u * 1024u / 4u;  /* ~2 MB per small step */
+            static id<MTLSharedEvent> ev;
+            if (!ev) ev = [dev newSharedEvent];
+            const uint64_t base = ev.signaledValue;
+
+            /* G baseline: serial */
+            uint64_t tg0 = mach_absolute_time();
+            id<MTLCommandBuffer> gcb = [q commandBuffer];
+            id<MTLComputeCommandEncoder> ge = [gcb computeCommandEncoder];
+            for (uint32_t L = 0; L < LAYERS; L++) {
+                encode_step(ge, 0);   /* big */
+                for (uint32_t s2 = 0; s2 < SMALL_STEPS; s2++) {
+                    [ge setComputePipelineState:pso];
+                    [ge setBuffer:big1 offset:0 atIndex:0];
+                    [ge setBuffer:dep1 offset:0 atIndex:1];
+                    [ge setBytes:&SMALL_N length:4 atIndex:2];
+                    [ge setBuffer:shared_ro offset:0 atIndex:3];
+                    [ge setBuffer:dep1 offset:0 atIndex:4];
+                    [ge dispatchThreads:MTLSizeMake(SMALL_GRID,1,1) threadsPerThreadgroup:tg];
+                }
+            }
+            [ge endEncoding];
+            [gcb commit]; [gcb waitUntilCompleted];
+            double gms = ms(tg0, mach_absolute_time());
+
+            /* F: dual CB, event-pipelined */
+            uint64_t tf0 = mach_absolute_time();
+            id<MTLCommandBuffer> mainCB = [q commandBuffer];
+            id<MTLCommandBuffer> sideCB = [q commandBuffer];
+            for (uint32_t L = 0; L < LAYERS; L++) {
+                /* main: big step for layer L, then wait for side(L) */
+                id<MTLComputeCommandEncoder> me = [mainCB computeCommandEncoder];
+                encode_step(me, 0);
+                [me endEncoding];
+                [mainCB encodeWaitForEvent:ev value:base + L + 1];
+                /* side: small chain for layer L, then signal */
+                id<MTLComputeCommandEncoder> se = [sideCB computeCommandEncoder];
+                for (uint32_t s2 = 0; s2 < SMALL_STEPS; s2++) {
+                    [se setComputePipelineState:pso];
+                    [se setBuffer:big1 offset:0 atIndex:0];
+                    [se setBuffer:dep1 offset:0 atIndex:1];
+                    [se setBytes:&SMALL_N length:4 atIndex:2];
+                    [se setBuffer:shared_ro offset:0 atIndex:3];
+                    [se setBuffer:dep1 offset:0 atIndex:4];
+                    [se dispatchThreads:MTLSizeMake(SMALL_GRID,1,1) threadsPerThreadgroup:tg];
+                }
+                [se endEncoding];
+                [sideCB encodeSignalEvent:ev value:base + L + 1];
+            }
+            [sideCB commit]; [mainCB commit];
+            [mainCB waitUntilCompleted];
+            double fms = ms(tf0, mach_absolute_time());
+            ev.signaledValue = base + LAYERS;
+
+            fprintf(stderr,
+                "rep%d  A serial-enc %.1f ms (gpu %.1f)  B two-CB %.1f  C conc+barrier %.1f  D two-queue %.1f  E arena-dep %.1f  |  G layered-serial %.1f  F event-pipelined %.1f  F/G=%.2f\n",
+                rep, a, a_gpu, b, cc_, d, eo, gms, fms, fms / gms);
+        }
     }
     return 0;
 }
