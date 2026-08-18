@@ -28649,6 +28649,18 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             prefill_shared64_default != 0 && n_head == 64u &&
             g_dsv4_indexed_attention_heads64_shared_pipeline != nil &&
             g_dsv4_indexed_attention_heads64_shared_pipeline.maxTotalThreadsPerThreadgroup >= 1024;
+        if (!decode_one_token && prefill_shared64_default != 0) {
+            static bool logged;
+            if (!logged) {
+                logged = true;
+                fprintf(stderr,
+                        "ds4: indexed attend prefill kernel: %s (pipeline max threads %lu)\n",
+                        prefill_shared64 ? "heads64_shared" : "heads8 fallback",
+                        g_dsv4_indexed_attention_heads64_shared_pipeline
+                            ? (unsigned long)g_dsv4_indexed_attention_heads64_shared_pipeline.maxTotalThreadsPerThreadgroup
+                            : 0ul);
+            }
+        }
         const uint32_t decode_splits =
             decode_one_token && !g_quality_mode ? 12u : 1u;
         const bool split_decode = decode_splits > 1u;
