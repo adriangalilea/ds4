@@ -20191,6 +20191,7 @@ static bool metal_graph_layer_stage_profile_boundary(
         uint32_t    n_tokens,
         double     *stage_t0);
 static bool metal_graph_decode_stage_profile_enabled(uint32_t il);
+static bool metal_graph_gpu_stage_timestamps(void);
 static bool metal_graph_matmul_plain_tensor(
         ds4_gpu_tensor       *out,
         const ds4_model        *model,
@@ -21920,6 +21921,19 @@ static bool metal_graph_encode_decode_layer_phase(
     bool ok = true;
     const bool decode_stage_profile = metal_graph_decode_stage_profile_enabled(il);
     double decode_stage_t0 = decode_stage_profile ? now_sec() : 0.0;
+    /* Decode side stream: the compressor/indexer/score/topk chain reads only
+     * the quad projection + triple-fusion outputs (qr_norm, KV stores) and
+     * per-layer persistent state -- never q_b/rope -- so it can ride a second
+     * command buffer and overlap the q_b matvec.  Excluded whenever a
+     * profiler wants per-stage CPU waits or mid-token flushes. */
+    const bool decode_side_stream =
+        phase == METAL_DECODE_LAYER_FULL &&
+        !decode_stage_profile &&
+        !g->decode_index_stage_profile &&
+        !metal_graph_gpu_stage_timestamps() &&
+        getenv("DS4_METAL_DECODE_SIDE_STREAM") != NULL;
+    bool side_forked = false;
+    bool side_routed = false;
     const bool fuse_shared_gate_up =
         !g->quality &&
         g->tp_world < 2 &&
@@ -22480,6 +22494,11 @@ static bool metal_graph_encode_decode_layer_phase(
     if (qkv_rms_fused && ok && !kv_rope_fused) {
         metal_graph_debug_dump_tensor("KVnorm", metal_graph_kv(g), DS4_N_HEAD_DIM, il, pos);
     }
+    if (decode_side_stream && ok && qkv_pair_quad_fused && kv_rope_fused &&
+        ds4_gpu_side_stream_token_begin()) {
+        ds4_gpu_side_mark_inputs_ready();
+        side_forked = true;
+    }
     /* Phase B head slice: under the real TP split this rank computes only
      * its heads [tp_head0, tp_head0 + tp_heads) end to end — q_b rows, the
      * per-head norm/rope, the attention core and its owned output groups.
@@ -22535,6 +22554,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                                 DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
     }
     DS4_METAL_PROFILE_DECODE_STAGE("q_path");
+    side_routed = side_forked && ok && ds4_gpu_side_route_begin();
     if (ok) {
         metal_graph_debug_dump_tensor("Qcur", metal_graph_q(g), q_dim, il, pos);
     }
@@ -23073,6 +23093,7 @@ static bool metal_graph_encode_decode_layer_phase(
         comp_cache = g->layer_attn_comp_cache[il];
     }
     DS4_METAL_PROFILE_DECODE_STAGE("compressor_indexer");
+    if (side_routed) ds4_gpu_side_route_end();
 
     if (stop_before_attn) return ok;
     if (ok) {

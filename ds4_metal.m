@@ -953,7 +953,14 @@ static NSUInteger ds4_gpu_tensor_offset(const ds4_gpu_tensor *tensor) {
 static id<MTLCommandBuffer> ds4_gpu_new_command_buffer(void);
 static void ds4_gpu_stream_expert_cache_note_owned_created(void);
 
+static BOOL g_side_routing_fwd(void);
+static id<MTLCommandBuffer> g_side_cb_fwd(void);
+
 static id<MTLCommandBuffer> ds4_gpu_command_buffer(int *owned) {
+    if (g_side_routing_fwd()) {
+        *owned = 0;
+        return g_side_cb_fwd();
+    }
     if (g_batch_cb) {
         *owned = 0;
         return g_batch_cb;
@@ -992,7 +999,11 @@ static inline int ds4_gpu_census_on(void) {
     return g_census_enabled;
 }
 
+static id<MTLComputeCommandEncoder> ds4_gpu_side_compute_encoder_fwd(id<MTLCommandBuffer> cb);
+
 static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer> cb) {
+    id<MTLComputeCommandEncoder> side = ds4_gpu_side_compute_encoder_fwd(cb);
+    if (side) return side;
     if (g_batch_cb && cb == g_batch_cb) {
         g_batch_has_work = YES;
         if (!g_batch_enc) {
@@ -1020,9 +1031,12 @@ static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer>
     return [cb computeCommandEncoder];
 }
 
+static BOOL ds4_gpu_side_owns_encoder_fwd(id<MTLCommandBuffer> cb, id<MTLComputeCommandEncoder> enc);
+
 static void ds4_gpu_end_compute_encoder(id<MTLCommandBuffer> cb, id<MTLComputeCommandEncoder> enc) {
     if (!enc) return;
     if (g_batch_cb && cb == g_batch_cb && enc == g_batch_enc) return;
+    if (ds4_gpu_side_owns_encoder_fwd(cb, enc)) return;
     [enc endEncoding];
 }
 
@@ -9072,11 +9086,14 @@ int ds4_gpu_flush_encoder(void) {
     return 1;
 }
 
+static void ds4_gpu_side_stream_commit_if_open(void);
+
 int ds4_gpu_flush_commands(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     ds4_gpu_parallel_ffn_reset_state(YES);
     if (!g_batch_cb) return 0;
 
+    ds4_gpu_side_stream_commit_if_open();
     ds4_gpu_close_batch_encoder();
     id<MTLCommandBuffer> cb = g_batch_cb;
     g_batch_cb = nil;
@@ -9404,6 +9421,136 @@ int ds4_gpu_parallel_ffn_finish(void) {
     return completed;
 }
 
+
+/* Decode side stream (DS4_METAL_DECODE_SIDE_STREAM, read per call): per
+ * decode layer the kv/compressor/indexer/score/topk chain is encoded into a
+ * second command buffer on its own queue and overlaps the q_b/rope chain in
+ * the main batch buffer.  Cross-CB ordering is explicit MTLSharedEvents:
+ * main signals "inputs ready" right after the quad projection fusion (the
+ * side chain's only main-stream input), side signals "results ready" after
+ * top-k, and main waits on that before FlashAttention.  Queues are in-order
+ * per queue, so cross-token state dependencies inside the side chain
+ * (compressor state, KV ring) stay ordered for free.  Every scratch tensor
+ * owns its own MTLBuffer (no arena), so tracked-hazard false serialization
+ * between the streams cannot occur (measured in tests/test_cb_overlap.m:
+ * shared reads are free, shared-buffer writes serialize).  The side buffer
+ * is committed immediately before the main buffer in end_commands; an
+ * uncommitted side buffer is simply dropped on error, and the abort path
+ * CPU-forces the shared-event values so a committed side buffer can never
+ * wedge the GPU waiting on a signal that will not come. */
+static id<MTLCommandQueue> g_side_queue;
+static id<MTLCommandBuffer> g_side_cb;
+static id<MTLComputeCommandEncoder> g_side_enc;
+static id<MTLSharedEvent> g_side_ev_inputs;   /* main -> side */
+static id<MTLSharedEvent> g_side_ev_results;  /* side -> main */
+static uint64_t g_side_inputs_val;
+static uint64_t g_side_results_val;
+static BOOL g_side_routing;
+static BOOL g_side_has_work;
+
+static BOOL g_side_routing_fwd(void) { return g_side_routing && g_side_cb != nil; }
+static id<MTLCommandBuffer> g_side_cb_fwd(void) { return g_side_cb; }
+
+static id<MTLComputeCommandEncoder> ds4_gpu_side_compute_encoder_fwd(id<MTLCommandBuffer> cb) {
+    if (!g_side_cb || cb != g_side_cb) return nil;
+    if (!g_side_enc) {
+        g_side_enc = [g_side_cb computeCommandEncoder];
+        if (ds4_gpu_census_on()) g_census_encoders++;
+    }
+    return g_side_enc;
+}
+
+static BOOL ds4_gpu_side_owns_encoder_fwd(id<MTLCommandBuffer> cb, id<MTLComputeCommandEncoder> enc) {
+    return g_side_cb && cb == g_side_cb && enc == g_side_enc;
+}
+
+static void ds4_gpu_close_side_encoder(void) {
+    if (!g_side_enc) return;
+    [g_side_enc endEncoding];
+    g_side_enc = nil;
+}
+
+int ds4_gpu_side_stream_token_begin(void) {
+    if (!g_batch_cb) return 0;
+    if (g_side_cb) return 1;
+    if (!g_side_queue) {
+        g_side_queue = [g_device newCommandQueue];
+        if (!g_side_queue) return 0;
+        g_side_queue.label = @"ds4 decode side stream";
+        if (@available(macOS 15.0, *)) {
+            if (g_model_residency_set &&
+                [g_side_queue respondsToSelector:@selector(addResidencySet:)]) {
+                [g_side_queue addResidencySet:(id)g_model_residency_set];
+            }
+        }
+    }
+    if (!g_side_ev_inputs) g_side_ev_inputs = [g_device newSharedEvent];
+    if (!g_side_ev_results) g_side_ev_results = [g_device newSharedEvent];
+    if (!g_side_ev_inputs || !g_side_ev_results) return 0;
+    g_side_cb = [g_side_queue commandBuffer];
+    if (!g_side_cb) return 0;
+    g_side_has_work = NO;
+    g_side_routing = NO;
+    if (ds4_gpu_census_on()) g_census_cbs_created++;
+    return 1;
+}
+
+void ds4_gpu_side_mark_inputs_ready(void) {
+    if (!g_side_cb || !g_batch_cb) return;
+    ds4_gpu_close_batch_encoder();
+    [g_batch_cb encodeSignalEvent:g_side_ev_inputs value:++g_side_inputs_val];
+}
+
+int ds4_gpu_side_route_begin(void) {
+    if (!g_side_cb || !g_batch_cb || g_side_routing) return 0;
+    ds4_gpu_close_side_encoder();
+    [g_side_cb encodeWaitForEvent:g_side_ev_inputs value:g_side_inputs_val];
+    g_side_routing = YES;
+    return 1;
+}
+
+void ds4_gpu_side_route_end(void) {
+    if (!g_side_routing) return;
+    g_side_routing = NO;
+    ds4_gpu_close_side_encoder();
+    [g_side_cb encodeSignalEvent:g_side_ev_results value:++g_side_results_val];
+    if (g_batch_cb) {
+        ds4_gpu_close_batch_encoder();
+        [g_batch_cb encodeWaitForEvent:g_side_ev_results value:g_side_results_val];
+    }
+    g_side_has_work = YES;
+}
+
+/* Commit the side buffer (called immediately before committing the main
+ * batch buffer).  Dropping an uncommitted side buffer is safe; committing
+ * one whose main-side signals were dropped is not, which is why the abort
+ * path below force-advances the event values instead. */
+static void ds4_gpu_side_stream_commit_if_open(void) {
+    if (!g_side_cb) return;
+    g_side_routing = NO;
+    ds4_gpu_close_side_encoder();
+    id<MTLCommandBuffer> cb = g_side_cb;
+    g_side_cb = nil;
+    if (!g_side_has_work) return; /* nothing routed: drop uncommitted */
+    g_side_has_work = NO;
+    if (ds4_gpu_census_on()) g_census_cbs_committed++;
+    [cb commit];
+    [g_pending_cbs addObject:cb];
+}
+
+void ds4_gpu_side_stream_abort(void) {
+    g_side_routing = NO;
+    ds4_gpu_close_side_encoder();
+    g_side_cb = nil;
+    /* A committed side buffer may still be waiting for an inputs signal
+     * riding a main buffer that will never commit. */
+    if (g_side_ev_inputs && g_side_ev_inputs.signaledValue < g_side_inputs_val) {
+        g_side_ev_inputs.signaledValue = g_side_inputs_val;
+    }
+    if (g_side_ev_results && g_side_ev_results.signaledValue < g_side_results_val) {
+        g_side_ev_results.signaledValue = g_side_results_val;
+    }
+}
 
 static int ds4_gpu_stream_expert_cache_wait_inflight(const char *label) {
     const char *what = label ? label : "streaming expert cache in-flight";
@@ -10150,9 +10297,11 @@ static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
 int ds4_gpu_end_commands(void) {
     if (!g_batch_cb) {
         ds4_gpu_parallel_ffn_reset_state(YES);
+        ds4_gpu_side_stream_abort();
         return 0;
     }
     ds4_gpu_parallel_ffn_reset_state(YES);
+    ds4_gpu_side_stream_commit_if_open();
     ds4_gpu_close_batch_encoder();
     id<MTLCommandBuffer> cb = g_batch_cb;
     g_batch_cb = nil;
@@ -10291,6 +10440,7 @@ int ds4_gpu_synchronize(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (g_batch_cb) return ds4_gpu_end_commands();
     ds4_gpu_parallel_ffn_reset_state(YES);
+    ds4_gpu_side_stream_abort();
     if ([g_pending_cbs count] != 0) {
         int ok = ds4_gpu_wait_pending_command_buffers("synchronize");
         [g_transient_buffers removeAllObjects];
@@ -10309,6 +10459,7 @@ void ds4_gpu_cleanup(void) {
     @autoreleasepool {
         ds4_gpu_decode_pipeline_fast_cache_reset();
         ds4_gpu_parallel_ffn_reset_state(YES);
+        ds4_gpu_side_stream_abort();
         if (g_batch_cb) {
             ds4_gpu_close_batch_encoder();
             [g_batch_cb commit];

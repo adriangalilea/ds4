@@ -75,6 +75,13 @@ int ds4_gpu_pack_slot_rows_f32_tensor(
         uint32_t                slot_cap);
 
 int ds4_gpu_begin_commands(void);
+/* Decode side stream: overlap the per-layer kv/compressor/indexer/score/topk
+ * chain with the q chain in a second command buffer (DS4_METAL_DECODE_SIDE_STREAM). */
+int  ds4_gpu_side_stream_token_begin(void);
+void ds4_gpu_side_mark_inputs_ready(void);
+int  ds4_gpu_side_route_begin(void);
+void ds4_gpu_side_route_end(void);
+void ds4_gpu_side_stream_abort(void);
 int ds4_gpu_flush_encoder(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_commands_active(void);
