@@ -6512,28 +6512,28 @@ kernel void kernel_dsv4_indexer_scores_tiled3_f16(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        /* The unroll pragma is load-bearing for bit-exactness: under fast
-         * math the compiler may unroll this batch loop and reassociate the
-         * loop-carried acc chain into a tree, which changes the rounding
-         * relative to tiled2's strictly sequential per-head adds (observed
-         * as ULP-level drift on M3 Ultra). */
-        if (token0 < args.n_tokens && comp0 < args.n_comp) {
-            device const float *w = (device const float *)(weights +
-                (uint64_t)token0 * args.weights_token_stride);
-#pragma clang loop unroll(disable)
-            for (uint h = 0; h < HB; h++) {
+        /* One apply per barrier region, exactly like tiled2: under fast math
+         * the compiler is free to reassociate or re-contract a batch of
+         * accumulator updates that share a region (observed as ULP drift on
+         * M3 Ultra with a plain HB-deep apply loop, with or without unroll /
+         * vectorize pragmas and with either contraction choice).  The
+         * mem_none barrier is uniform (outside the per-thread guards) and
+         * cheap; it reproduces the exact codegen environment of tiled2's
+         * per-head apply, so the acc chain rounds identically. */
+        for (uint h = 0; h < HB; h++) {
+            if (token0 < args.n_tokens && comp0 < args.n_comp) {
+                device const float *w = (device const float *)(weights +
+                    (uint64_t)token0 * args.weights_token_stride);
                 const float sc = dot[h*(TM*TN) + row0*TN + col0];
                 acc0 += max(sc, 0.0f) * (w[hb + h] * args.scale);
             }
-        }
-        if (token1 < args.n_tokens && comp1 < args.n_comp) {
-            device const float *w = (device const float *)(weights +
-                (uint64_t)token1 * args.weights_token_stride);
-#pragma clang loop unroll(disable)
-            for (uint h = 0; h < HB; h++) {
+            if (token1 < args.n_tokens && comp1 < args.n_comp) {
+                device const float *w = (device const float *)(weights +
+                    (uint64_t)token1 * args.weights_token_stride);
                 const float sc = dot[h*(TM*TN) + row1*TN + col1];
                 acc1 += max(sc, 0.0f) * (w[hb + h] * args.scale);
             }
+            threadgroup_barrier(mem_flags::mem_none);
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);

@@ -17576,10 +17576,10 @@ static int ds4_gpu_indexer_scores_batch_tensor(
         const char *tiled3_env = getenv("DS4_METAL_INDEXER_SCORES_TILED3");
         const bool use_tiled3 = use_tiled2 && (n_head % 8u) == 0u &&
             tiled3_env != NULL;
-        /* "8" selects the HB=8 head-batched kernel (known ULP drift from
-         * fast-math reassociation of the apply chain); anything else gets
-         * the bit-exact direct-load variant. */
-        const bool use_tiled3b = use_tiled3 && tiled3_env[0] != '8';
+        /* "b" selects the bisect variant (tiled2's body with direct loads
+         * only, kept for divergence hunting); anything else gets the
+         * head-batched kernel. */
+        const bool use_tiled3b = use_tiled3 && tiled3_env[0] == 'b';
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
             use_nax ? "kernel_dsv4_indexer_scores_nax" :
             (g_quality_mode ? "kernel_dsv4_indexer_scores_tiled_f32" :
