@@ -17947,13 +17947,14 @@ int ds4_gpu_indexer_topk_tensor(
             fprintf(stderr, "ds4: Metal graph indexer top-k received undersized buffers\n");
             return 0;
         }
-        /* Candidate (read per call): exact streaming top-512 — one pass over
-         * the score row with a running 512th-best threshold, in place of the
-         * padded bitonic + merge cascade.  Output list is bit-identical to
-         * the CANON comparator path (same (score desc, idx asc) total
-         * order). */
+        /* Default (rollback env read per call): exact streaming top-512 —
+         * one pass over the score row with a running 512th-best threshold,
+         * in place of the padded bitonic + merge cascade.  Output list is
+         * bit-identical to the CANON comparator path (same (score desc,
+         * idx asc) total order).  Measured: cold64k 538->547 t/s (+1.7%),
+         * monotone with context. */
         if (top_k == 512u && n_tokens >= 32u &&
-            getenv("DS4_METAL_TOPK_STREAM512") != NULL) {
+            getenv("DS4_METAL_DISABLE_TOPK_STREAM512") == NULL) {
             static int logged_stream512;
             if (!logged_stream512) {
                 logged_stream512 = 1;
@@ -17992,11 +17993,11 @@ int ds4_gpu_indexer_topk_tensor(
             ds4_gpu_end_compute_encoder(cb, enc);
             return ds4_gpu_finish_command_buffer(cb, owned, "indexer topk stream512");
         }
-        /* Candidate (read per call): canonical (score desc, idx asc) total
-         * order — tie order among equal scores is the only output change;
-         * prerequisite for streaming top-k. */
+        /* Default (rollback env read per call): canonical (score desc,
+         * idx asc) total order — tie order among equal scores is the only
+         * output change; prerequisite for the streaming top-k above. */
         id<MTLComputePipelineState> sort_pipeline =
-            getenv("DS4_METAL_ARGSORT_CANON") != NULL
+            getenv("DS4_METAL_DISABLE_ARGSORT_CANON") == NULL
                 ? ds4_gpu_get_pipeline("kernel_argsort_f32_i32_desc_canon")
                 : g_argsort_f32_i32_desc_pipeline;
         if (!sort_pipeline) return 0;
