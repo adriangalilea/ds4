@@ -169,13 +169,19 @@ int main(int argc, char **argv) {
          * G: same layers/steps but everything serial in one encoder
          *    (the baseline decode shape). */
         {
-            const uint32_t LAYERS = 8;
-            const uint32_t SMALL_STEPS = 32;
+            const uint32_t LAYERS = argc > 4 ? (uint32_t)atoi(argv[4]) : 8;
+            const uint32_t SMALL_STEPS = argc > 5 ? (uint32_t)atoi(argv[5]) : 32;
             const uint32_t SMALL_GRID = 4096;
-            const uint32_t SMALL_N = 2u * 1024u * 1024u / 4u;  /* ~2 MB per small step */
-            static id<MTLSharedEvent> ev;
-            if (!ev) ev = [dev newSharedEvent];
-            const uint64_t base = ev.signaledValue;
+            const uint32_t SMALL_N = argc > 6 ? (uint32_t)atoi(argv[6]) * 256u
+                                              : 2u * 1024u * 1024u / 4u; /* argv[6] = KB per small step */
+            static id<MTLSharedEvent> ev_shared;
+            static id<MTLEvent> ev_plain;
+            static uint64_t plain_base_ctr;
+            const bool evplain = getenv("EVPLAIN") != NULL;
+            if (!ev_shared) ev_shared = [dev newSharedEvent];
+            if (!ev_plain) ev_plain = [dev newEvent];
+            id<MTLEvent> ev = evplain ? ev_plain : (id<MTLEvent>)ev_shared;
+            const uint64_t base = evplain ? plain_base_ctr : ev_shared.signaledValue;
 
             /* G baseline: serial */
             uint64_t tg0 = mach_absolute_time();
@@ -199,20 +205,32 @@ int main(int argc, char **argv) {
 
             /* F: dual CB, event-pipelined */
             uint64_t tf0 = mach_absolute_time();
+            static id<MTLSharedEvent> ev2_shared;
+            static id<MTLEvent> ev2_plain;
+            static uint64_t plain_base2_ctr;
+            if (!ev2_shared) ev2_shared = [dev newSharedEvent];
+            if (!ev2_plain) ev2_plain = [dev newEvent];
+            id<MTLEvent> ev2 = evplain ? ev2_plain : (id<MTLEvent>)ev2_shared;
+            const uint64_t base2 = evplain ? plain_base2_ctr : ev2_shared.signaledValue;
+            const bool bidir = getenv("BIDIR") != NULL;
+            static id<MTLCommandQueue> qside;
+            if (!qside) qside = [dev newCommandQueue];
             id<MTLCommandBuffer> mainCB = [q commandBuffer];
-            id<MTLCommandBuffer> sideCB = [q commandBuffer];
+            id<MTLCommandBuffer> sideCB = [(bidir ? qside : q) commandBuffer];
             for (uint32_t L = 0; L < LAYERS; L++) {
                 /* main: big step for layer L, then wait for side(L) */
+                if (bidir) [mainCB encodeSignalEvent:ev2 value:base2 + L + 1];
                 id<MTLComputeCommandEncoder> me = [mainCB computeCommandEncoder];
                 encode_step(me, 0);
                 [me endEncoding];
                 [mainCB encodeWaitForEvent:ev value:base + L + 1];
                 /* side: small chain for layer L, then signal */
+                if (bidir) [sideCB encodeWaitForEvent:ev2 value:base2 + L + 1];
                 id<MTLComputeCommandEncoder> se = [sideCB computeCommandEncoder];
                 for (uint32_t s2 = 0; s2 < SMALL_STEPS; s2++) {
                     [se setComputePipelineState:pso];
                     [se setBuffer:big1 offset:0 atIndex:0];
-                    [se setBuffer:dep1 offset:0 atIndex:1];
+                    [se setBuffer:(getenv("CROSSDEP") ? dep0 : dep1) offset:0 atIndex:1];
                     [se setBytes:&SMALL_N length:4 atIndex:2];
                     [se setBuffer:shared_ro offset:0 atIndex:3];
                     [se setBuffer:dep1 offset:0 atIndex:4];
@@ -224,7 +242,13 @@ int main(int argc, char **argv) {
             [sideCB commit]; [mainCB commit];
             [mainCB waitUntilCompleted];
             double fms = ms(tf0, mach_absolute_time());
-            ev.signaledValue = base + LAYERS;
+            if (evplain) {
+                plain_base_ctr = base + LAYERS;
+                if (bidir) plain_base2_ctr = base2 + LAYERS;
+            } else {
+                ev_shared.signaledValue = base + LAYERS;
+                if (bidir) ev2_shared.signaledValue = base2 + LAYERS;
+            }
 
             fprintf(stderr,
                 "rep%d  A serial-enc %.1f ms (gpu %.1f)  B two-CB %.1f  C conc+barrier %.1f  D two-queue %.1f  E arena-dep %.1f  |  G layered-serial %.1f  F event-pipelined %.1f  F/G=%.2f\n",

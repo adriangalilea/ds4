@@ -9441,8 +9441,16 @@ int ds4_gpu_parallel_ffn_finish(void) {
 static id<MTLCommandQueue> g_side_queue;
 static id<MTLCommandBuffer> g_side_cb;
 static id<MTLComputeCommandEncoder> g_side_enc;
-static id<MTLSharedEvent> g_side_ev_inputs;   /* main -> side */
-static id<MTLSharedEvent> g_side_ev_results;  /* side -> main */
+/* Plain MTLEvents, deliberately NOT shared: a dependent cross-queue
+ * MTLSharedEvent round trip costs ~120-240 us of scheduling latency per
+ * hop (its CPU-visibility machinery), which at 86 just-in-time hops per
+ * decode token was measured as -31 % end to end; plain GPU-only events
+ * measure free in the same topology (tests/test_cb_overlap.m BIDIR/
+ * EVPLAIN).  The abort path GPU-signals them from a rescue queue since
+ * CPU forcing needs a shared event. */
+static id<MTLEvent> g_side_ev_inputs;   /* main -> side */
+static id<MTLEvent> g_side_ev_results;  /* side -> main */
+static id<MTLCommandQueue> g_side_rescue_queue;
 static uint64_t g_side_inputs_val;
 static uint64_t g_side_results_val;
 static BOOL g_side_routing;
@@ -9484,8 +9492,8 @@ int ds4_gpu_side_stream_token_begin(void) {
             }
         }
     }
-    if (!g_side_ev_inputs) g_side_ev_inputs = [g_device newSharedEvent];
-    if (!g_side_ev_results) g_side_ev_results = [g_device newSharedEvent];
+    if (!g_side_ev_inputs) g_side_ev_inputs = [g_device newEvent];
+    if (!g_side_ev_results) g_side_ev_results = [g_device newEvent];
     if (!g_side_ev_inputs || !g_side_ev_results) return 0;
     g_side_cb = [g_side_queue commandBuffer];
     if (!g_side_cb) return 0;
@@ -9539,17 +9547,24 @@ static void ds4_gpu_side_stream_commit_if_open(void) {
 }
 
 void ds4_gpu_side_stream_abort(void) {
+    const BOOL had_side = g_side_cb != nil || g_side_inputs_val != 0 ||
+                          g_side_results_val != 0;
     g_side_routing = NO;
     ds4_gpu_close_side_encoder();
     g_side_cb = nil;
-    /* A committed side buffer may still be waiting for an inputs signal
-     * riding a main buffer that will never commit. */
-    if (g_side_ev_inputs && g_side_ev_inputs.signaledValue < g_side_inputs_val) {
-        g_side_ev_inputs.signaledValue = g_side_inputs_val;
-    }
-    if (g_side_ev_results && g_side_ev_results.signaledValue < g_side_results_val) {
-        g_side_ev_results.signaledValue = g_side_results_val;
-    }
+    if (!had_side || (!g_side_ev_inputs && !g_side_ev_results)) return;
+    /* A committed buffer on either queue may still be waiting for a signal
+     * riding a buffer that will never commit.  Plain MTLEvents cannot be
+     * CPU-forced, so GPU-signal both forward from a rescue queue (a third
+     * queue: signals fire regardless of either stream queue's head being
+     * stalled). */
+    if (!g_side_rescue_queue) g_side_rescue_queue = [g_device newCommandQueue];
+    if (!g_side_rescue_queue) return;
+    id<MTLCommandBuffer> rescue = [g_side_rescue_queue commandBuffer];
+    if (!rescue) return;
+    if (g_side_ev_inputs) [rescue encodeSignalEvent:g_side_ev_inputs value:g_side_inputs_val];
+    if (g_side_ev_results) [rescue encodeSignalEvent:g_side_ev_results value:g_side_results_val];
+    [rescue commit];
 }
 
 static int ds4_gpu_stream_expert_cache_wait_inflight(const char *label) {
