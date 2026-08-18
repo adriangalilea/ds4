@@ -23,6 +23,7 @@ typedef struct {
     const char *model_path;
     const char *prompt_path;
     const char *candidate_env;
+    const char *candidate_env_value;
     int prefix_tokens;
     int warmup_tokens;
     int ctx;
@@ -41,7 +42,8 @@ static void usage(FILE *fp, const char *argv0) {
             "\n"
             "  -m, --model PATH       GGUF path (default: ds4flash.gguf)\n"
             "  --prompt-file PATH     token source (default: ds4.c)\n"
-            "  --candidate-env NAME   unset NAME for control, set NAME=1 for candidate\n"
+            "  --candidate-env NAME[=VALUE]   unset NAME for control, set NAME=VALUE\n"
+            "                         (default 1) for candidate\n"
             "  --prefix-tokens N      timed prefill length (default: 8192)\n"
             "  --warmup-tokens N      untimed tokens per variant (default: 32; min: 32)\n"
             "  --ctx N                session allocation (default: max lengths + 1)\n"
@@ -78,6 +80,7 @@ static bench_config parse_options(int argc, char **argv) {
         .model_path = "ds4flash.gguf",
         .prompt_path = "ds4.c",
         .candidate_env = NULL,
+        .candidate_env_value = "1",
         .prefix_tokens = DEFAULT_PREFIX_TOKENS,
         .warmup_tokens = DEFAULT_WARMUP_TOKENS,
         .ctx = 0,
@@ -113,8 +116,25 @@ static bench_config parse_options(int argc, char **argv) {
         }
     }
 
-    if (!cfg.candidate_env || cfg.candidate_env[0] == '\0' ||
-        strchr(cfg.candidate_env, '=') != NULL) {
+    static char candidate_env_name[256];
+    if (cfg.candidate_env) {
+        const char *eq = strchr(cfg.candidate_env, '=');
+        if (eq) {
+            const size_t name_len = (size_t)(eq - cfg.candidate_env);
+            if (name_len == 0 || name_len >= sizeof(candidate_env_name) ||
+                eq[1] == '\0') {
+                fprintf(stderr,
+                        "%s: --candidate-env NAME=VALUE requires a non-empty "
+                        "name and value\n", BENCH_NAME);
+                exit(2);
+            }
+            memcpy(candidate_env_name, cfg.candidate_env, name_len);
+            candidate_env_name[name_len] = '\0';
+            cfg.candidate_env_value = eq + 1;
+            cfg.candidate_env = candidate_env_name;
+        }
+    }
+    if (!cfg.candidate_env || cfg.candidate_env[0] == '\0') {
         fprintf(stderr, "%s: --candidate-env requires a valid name\n", BENCH_NAME);
         exit(2);
     }
@@ -186,7 +206,7 @@ static int select_variant(const bench_config *cfg, int variant) {
     const int env_rc =
         variant == 0
             ? unsetenv(cfg->candidate_env)
-            : setenv(cfg->candidate_env, "1", 1);
+            : setenv(cfg->candidate_env, cfg->candidate_env_value, 1);
     if (env_rc != 0) {
         fprintf(stderr,
                 "%s: failed to select %s with %s: %s\n",
