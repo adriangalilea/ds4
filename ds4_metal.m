@@ -5024,16 +5024,26 @@ static ds4_gpu_mv_dispatch ds4_gpu_make_q8_0_mv_dispatch(void) {
      * with vectorized loads — the decode timeline puts the scalar-load Q8
      * matvec at ~62 % of DRAM peak. */
     const bool vec = getenv("DS4_METAL_Q8_MV_VEC") != NULL;
-    /* Candidate (read per call): eight rows per threadgroup — same per-row
-     * math, fatter contiguous streams. */
-    const bool nr8 = !vec && getenv("DS4_METAL_Q8_MV_NR8") != NULL;
+    /* Candidate ladder (valued env, read per call): rows per threadgroup —
+     * per-row math identical at every width, only the stream shape changes.
+     * Values 4/8/16/32 select the matching instantiation; NR8 keeps its
+     * boolean env for the bench that only sets =1. */
+    const char *nr_env = getenv("DS4_METAL_Q8_MV_NR0");
+    uint32_t nr = nr_env ? (uint32_t)strtoul(nr_env, NULL, 10) : 0u;
+    if (!nr && getenv("DS4_METAL_Q8_MV_NR8") != NULL) nr = 8u;
+    if (nr != 4u && nr != 8u && nr != 16u && nr != 32u) nr = 0u;
+    const char *nr_name =
+        nr == 4u ? "kernel_mul_mv_q8_0_f32_nr4" :
+        nr == 8u ? "kernel_mul_mv_q8_0_f32_nr8" :
+        nr == 16u ? "kernel_mul_mv_q8_0_f32_nr16" :
+        nr == 32u ? "kernel_mul_mv_q8_0_f32_nr32" : NULL;
     return (ds4_gpu_mv_dispatch) {
-        .function_name = nr8 ? "kernel_mul_mv_q8_0_f32_nr8" :
+        .function_name = nr_name ? nr_name :
                          vec ? "kernel_mul_mv_q8_0_f32_v4"
                              : "kernel_mul_mv_q8_0_f32",
         .nsg = nsg,
-        .nr0 = (int32_t)(nr8 ? 8 : 2),
-        .smem = 32u * (nr8 ? 8u : 2u) * sizeof(float),
+        .nr0 = (int32_t)(nr ? nr : 2u),
+        .smem = 32u * (nr ? nr : 2u) * sizeof(float),
     };
 }
 

@@ -285,18 +285,24 @@ kernel void kernel_mul_mv_q8_0_f32_v4(
 // are bit-identical.  The experiment: fewer, fatter, contiguous row streams
 // per threadgroup against the ~330 GB/s single-token matvec ceiling that
 // neither wider loads nor more simdgroups moved.
-[[host_name("kernel_mul_mv_q8_0_f32_nr8")]]
-kernel void kernel_mul_mv_q8_0_f32_nr8(
-        constant ds4_metal_args_mul_mv & args,
-        device const char * src0,
-        device const char * src1,
-        device       char * dst,
-        threadgroup  char * shmem [[threadgroup(0)]],
-        uint3  tgpig[[threadgroup_position_in_grid]],
-        ushort tiisg[[thread_index_in_simdgroup]],
-        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    kernel_mul_mv_q8_0_f32_impl<8, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+#define DS4_Q8_MV_NR_VARIANT(NR)                                            \
+[[host_name("kernel_mul_mv_q8_0_f32_nr" #NR)]]                              \
+kernel void kernel_mul_mv_q8_0_f32_nr##NR(                                  \
+        constant ds4_metal_args_mul_mv & args,                              \
+        device const char * src0,                                           \
+        device const char * src1,                                           \
+        device       char * dst,                                            \
+        threadgroup  char * shmem [[threadgroup(0)]],                       \
+        uint3  tgpig[[threadgroup_position_in_grid]],                       \
+        ushort tiisg[[thread_index_in_simdgroup]],                          \
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {                   \
+    kernel_mul_mv_q8_0_f32_impl<NR, constant ds4_metal_args_mul_mv &>(      \
+        args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);                 \
 }
+DS4_Q8_MV_NR_VARIANT(4)
+DS4_Q8_MV_NR_VARIANT(8)
+DS4_Q8_MV_NR_VARIANT(16)
+DS4_Q8_MV_NR_VARIANT(32)
 
 // Decode-time Q8_0 matrix-vector multiply. DS4 uses this for Q8_0 dense
 // projections such as shared experts and output-side small matvecs.
