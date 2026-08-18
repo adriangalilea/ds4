@@ -19097,7 +19097,15 @@ static int ds4_gpu_indexer_topk_tensor_impl(
             fprintf(stderr, "ds4: Metal graph indexer top-k received undersized buffers\n");
             return 0;
         }
-        NSUInteger max_threads = g_argsort_f32_i32_desc_pipeline.maxTotalThreadsPerThreadgroup;
+        /* Candidate (read per call): canonical (score desc, idx asc) total
+         * order — tie order among equal scores is the only output change;
+         * prerequisite for streaming top-k. */
+        id<MTLComputePipelineState> sort_pipeline =
+            getenv("DS4_METAL_ARGSORT_CANON") != NULL
+                ? ds4_gpu_get_pipeline("kernel_argsort_f32_i32_desc_canon")
+                : g_argsort_f32_i32_desc_pipeline;
+        if (!sort_pipeline) return 0;
+        NSUInteger max_threads = sort_pipeline.maxTotalThreadsPerThreadgroup;
         if (max_threads == 0) max_threads = 256;
         int32_t nth = 1;
         while ((uint32_t)nth < n_comp && (uint64_t)2u * (uint64_t)nth <= (uint64_t)max_threads) {
