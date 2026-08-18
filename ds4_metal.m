@@ -17576,10 +17576,12 @@ static int ds4_gpu_indexer_scores_batch_tensor(
          * outputs. */
         const bool use_tiled4 = use_tiled2 &&
             getenv("DS4_METAL_INDEXER_SCORES_TILED4") != NULL;
-        /* Candidate on top of tiled4: K tiles resident in simdgroup
-         * registers across the head loop.  Opt-in env, read per call. */
-        const bool use_tiled5 = use_tiled2 &&
-            getenv("DS4_METAL_INDEXER_SCORES_TILED5") != NULL;
+        /* Default scorer since 2026-08-18: K tiles resident in simdgroup
+         * registers across the head loop (TM=16 register blocking on top of
+         * tiled2's packing).  Bit-identical outputs; the rollback env is
+         * read per call for the ABBA variant bench. */
+        const bool use_tiled5 = use_tiled2 && !use_tiled4 &&
+            getenv("DS4_METAL_DISABLE_INDEXER_SCORES_TILED5") == NULL;
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
             use_nax ? "kernel_dsv4_indexer_scores_nax" :
             (g_quality_mode ? "kernel_dsv4_indexer_scores_tiled_f32" :
