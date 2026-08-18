@@ -29,6 +29,7 @@ typedef struct {
     const char *model_path;
     const char *prompt_path;
     const char *candidate_env;
+    const char *candidate_env_value;
     int prefix_tokens;
     int ctx;
     int warmup;
@@ -87,6 +88,7 @@ static bench_config parse_options(int argc, char **argv) {
         .model_path = "ds4flash.gguf",
         .prompt_path = "ds4.c",
         .candidate_env = NULL,
+        .candidate_env_value = "1",
         .prefix_tokens = DEFAULT_PREFIX_TOKENS,
         .ctx = DEFAULT_CTX,
         .warmup = DEFAULT_WARMUP,
@@ -150,6 +152,24 @@ static bench_config parse_options(int argc, char **argv) {
      * Explicit candidate split arguments can still combine a feature and
      * schedule experiment when desired.
      */
+    static char candidate_env_name[256];
+    if (cfg.candidate_env) {
+        const char *eq = strchr(cfg.candidate_env, '=');
+        if (eq) {
+            const size_t name_len = (size_t)(eq - cfg.candidate_env);
+            if (name_len == 0 || name_len >= sizeof(candidate_env_name) ||
+                eq[1] == '\0') {
+                fprintf(stderr,
+                        "metal-decode-schedule-bench: --candidate-env "
+                        "NAME=VALUE requires a non-empty name and value\n");
+                exit(2);
+            }
+            memcpy(candidate_env_name, cfg.candidate_env, name_len);
+            candidate_env_name[name_len] = '\0';
+            cfg.candidate_env_value = eq + 1;
+            cfg.candidate_env = candidate_env_name;
+        }
+    }
     if (cfg.candidate_env) {
         if (!candidate_first_explicit) {
             cfg.candidate.first = cfg.control.first;
@@ -249,7 +269,7 @@ static int select_variant(const bench_config *cfg, int variant) {
     if (cfg->candidate_env &&
         (variant == 0
              ? unsetenv(cfg->candidate_env)
-             : setenv(cfg->candidate_env, "1", 1)) != 0) {
+             : setenv(cfg->candidate_env, cfg->candidate_env_value, 1)) != 0) {
         fprintf(stderr,
                 "metal-decode-schedule-bench: failed to select candidate "
                 "environment %s for %s: %s\n",
