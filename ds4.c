@@ -22497,7 +22497,14 @@ static bool metal_graph_encode_decode_layer_phase(
     if (decode_side_stream && ok && qkv_pair_quad_fused && kv_rope_fused &&
         ds4_gpu_side_stream_token_begin()) {
         ds4_gpu_side_mark_inputs_ready();
-        side_forked = true;
+        const char *side_mode = getenv("DS4_METAL_DECODE_SIDE_STREAM");
+        if (side_mode && strcmp(side_mode, "empty") == 0) {
+            /* Diagnostic: full per-layer event round trip and encoder
+             * splits, zero routed work — prices the machinery alone. */
+            if (ds4_gpu_side_route_begin()) ds4_gpu_side_route_end();
+        } else {
+            side_forked = true;
+        }
     }
     /* Phase B head slice: under the real TP split this rank computes only
      * its heads [tp_head0, tp_head0 + tp_heads) end to end — q_b rows, the
