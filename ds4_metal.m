@@ -28698,6 +28698,30 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         const uint32_t decode_splits =
             decode_one_token && !g_quality_mode ? 12u : 1u;
         const bool split_decode = decode_splits > 1u;
+        /* Candidate: row-batched staging for the pre-M5 prefill attend path
+         * (the heads8 kernel stages one K/V row per barrier pair — over a
+         * thousand barriers per (token, head group) at top_k=512, with one
+         * row fetch in flight per threadgroup).  Opt-in env, read per call
+         * for the ABBA variant bench; value = rows per barrier pair (4, 8,
+         * or 16 — 16 reuses the decode kernel).  Row order and the online
+         * softmax math are preserved, the decode rb16 kernel being the
+         * in-repo exactness precedent for the batching. */
+        const char *attend_rb_env = (!decode_one_token && !split_decode &&
+                                     !prefill_dual_heads) ?
+            getenv("DS4_METAL_ATTEND_RB") : NULL;
+        const uint32_t attend_rb = attend_rb_env ?
+            (uint32_t)strtoul(attend_rb_env, NULL, 10) : 0u;
+        const bool prefill_rb = attend_rb == 4u || attend_rb == 8u ||
+            attend_rb == 16u;
+        if (prefill_rb) {
+            static int logged_attend_rb;
+            if (!logged_attend_rb) {
+                logged_attend_rb = 1;
+                fprintf(stderr,
+                        "ds4: metal indexed attention prefill using heads8_rb%u "
+                        "(row-batched staging)\n", attend_rb);
+            }
+        }
         id<MTLComputePipelineState> attn_pipeline =
             split_decode ?
             ds4_gpu_hot_pipeline(
@@ -28709,6 +28733,12 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             prefill_dual_heads ?
             ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads16_dual_pipeline,
                                    "kernel_dsv4_indexed_mixed_attention_heads16_dual") :
+            prefill_rb ?
+            ds4_gpu_get_pipeline(attend_rb == 4u ?
+                "kernel_dsv4_indexed_mixed_attention_heads8_rb4" :
+                attend_rb == 8u ?
+                "kernel_dsv4_indexed_mixed_attention_heads8_rb8" :
+                "kernel_dsv4_indexed_mixed_attention_heads8_rb16") :
             ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads8_pipeline,
                                    "kernel_dsv4_indexed_mixed_attention_heads8");
         id<MTLComputePipelineState> split_reduce_pipeline = split_decode ?
@@ -28843,7 +28873,8 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                  atIndex:4];
             [enc setBuffer:sinks_buf offset:(NSUInteger)sinks_inner atIndex:5];
             [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:6];
-            [enc setThreadgroupMemoryLength:(decode_one_token ? 16u : 1u) *
+            [enc setThreadgroupMemoryLength:(decode_one_token ? 16u :
+                                             prefill_rb ? attend_rb : 1u) *
                                             128u * 4u * sizeof(uint16_t)
                                     atIndex:0];
             [enc dispatchThreadgroups:

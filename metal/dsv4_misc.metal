@@ -5697,10 +5697,14 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads16_dual(
 // Decode specialization of kernel_dsv4_indexed_mixed_attention_heads8.
 // Generation attends one token at a time, so the ratio-4 indexed path spends a
 // visible amount of time repeatedly staging the same K/V row for the eight
-// heads in a group. This variant stages sixteen selected rows at once and then
+// heads in a group. This variant stages RB selected rows at once and then
 // consumes them sequentially, preserving the row order and online softmax math
-// while cutting threadgroup barriers in the long top-k scan.
-kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16(
+// while cutting threadgroup barriers in the long top-k scan.  RB=16 is the
+// established decode kernel; the narrower RB=4/RB=8 instantiations exist for
+// the prefill path, where many threadgroups are resident per core and the
+// smaller staging footprint (4-8 KB) preserves occupancy.
+template <uint RB>
+static inline void dsv4_attend_h8_rb_body(
         constant ds4_metal_args_dsv4_indexed_attention & args,
         device const char *q,
         device const char *raw_kv,
@@ -5708,11 +5712,11 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16(
         device const char *topk,
         device const char *sinks,
         device       char *dst,
-        threadgroup half4 *kv_shared [[threadgroup(0)]],
-        uint2  tgpig [[threadgroup_position_in_grid]],
-        ushort tid   [[thread_index_in_threadgroup]],
-        ushort lane  [[thread_index_in_simdgroup]],
-        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+        threadgroup half4 *kv_shared,
+        uint2  tgpig,
+        ushort tid,
+        ushort lane,
+        ushort sg) {
     const uint token = tgpig.x;
     const uint head = tgpig.y * 8u + (uint)sg;
     if (token >= args.n_tokens || head >= args.n_head) {
@@ -5744,8 +5748,8 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16(
     uint last = min(qpos, raw_last_pos);
 
     if (first <= last) {
-        for (uint pos0 = first; pos0 <= last; pos0 += 16u) {
-            const uint n_rows = min(16u, last - pos0 + 1u);
+        for (uint pos0 = first; pos0 <= last; pos0 += RB) {
+            const uint n_rows = min(RB, last - pos0 + 1u);
             for (uint off = (uint)tid; off < n_rows * 128u; off += 256u) {
                 const uint r = off >> 7;
                 const uint c = off & 127u;
@@ -5774,10 +5778,10 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16(
     device const int32_t *row_topk = (device const int32_t *)(topk +
         (uint64_t)token * args.topk_token_stride);
     bool stop = false;
-    for (uint i = 0; i < args.top_k && !stop; i += 16u) {
-        uint rows[16];
+    for (uint i = 0; i < args.top_k && !stop; i += RB) {
+        uint rows[RB];
         uint n_rows = 0;
-        for (uint j = 0; j < 16u && i + j < args.top_k; j++) {
+        for (uint j = 0; j < RB && i + j < args.top_k; j++) {
             const int32_t idx = row_topk[i + j];
             if (idx < 0) {
                 continue;
@@ -5823,6 +5827,57 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16(
     dst4[lane + 32] = o1 * inv_s;
     dst4[lane + 64] = o2 * inv_s;
     dst4[lane + 96] = o3 * inv_s;
+}
+
+kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16(
+        constant ds4_metal_args_dsv4_indexed_attention & args,
+        device const char *q,
+        device const char *raw_kv,
+        device const char *comp_kv,
+        device const char *topk,
+        device const char *sinks,
+        device       char *dst,
+        threadgroup half4 *kv_shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    dsv4_attend_h8_rb_body<16u>(args, q, raw_kv, comp_kv, topk, sinks, dst,
+                                kv_shared, tgpig, tid, lane, sg);
+}
+
+kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb8(
+        constant ds4_metal_args_dsv4_indexed_attention & args,
+        device const char *q,
+        device const char *raw_kv,
+        device const char *comp_kv,
+        device const char *topk,
+        device const char *sinks,
+        device       char *dst,
+        threadgroup half4 *kv_shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    dsv4_attend_h8_rb_body<8u>(args, q, raw_kv, comp_kv, topk, sinks, dst,
+                               kv_shared, tgpig, tid, lane, sg);
+}
+
+kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb4(
+        constant ds4_metal_args_dsv4_indexed_attention & args,
+        device const char *q,
+        device const char *raw_kv,
+        device const char *comp_kv,
+        device const char *topk,
+        device const char *sinks,
+        device       char *dst,
+        threadgroup half4 *kv_shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    dsv4_attend_h8_rb_body<4u>(args, q, raw_kv, comp_kv, topk, sinks, dst,
+                               kv_shared, tgpig, tid, lane, sg);
 }
 
 // Long-context decode specialization of the indexed mixed-attention path.
