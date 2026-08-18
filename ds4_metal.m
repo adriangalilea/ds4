@@ -5020,8 +5020,13 @@ static ds4_gpu_mv_dispatch ds4_gpu_make_q8_0_mv_dispatch(void) {
     const uint64_t default_nsg = ds4_gpu_tp_world_is_two() ? 2u : 4u;
     const int16_t nsg =
         (int16_t)ds4_gpu_env_u64("DS4_METAL_Q8_MV_NSG", default_nsg, 1u, 8u);
+    /* Candidate (read per call for the ABBA bench): identical arithmetic
+     * with vectorized loads — the decode timeline puts the scalar-load Q8
+     * matvec at ~62 % of DRAM peak. */
+    const bool vec = getenv("DS4_METAL_Q8_MV_VEC") != NULL;
     return (ds4_gpu_mv_dispatch) {
-        .function_name = "kernel_mul_mv_q8_0_f32",
+        .function_name = vec ? "kernel_mul_mv_q8_0_f32_v4"
+                             : "kernel_mul_mv_q8_0_f32",
         .nsg = nsg,
         .nr0 = 2,
         .smem = 32u * 2u * sizeof(float),

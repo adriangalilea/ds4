@@ -182,6 +182,103 @@ void kernel_mul_mv_q8_0_f32_impl(
     helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
 }
 
+// Vector-load variant of the Q8_0 matvec: identical arithmetic in the
+// identical order (each product and add is the same scalar chain), only the
+// loads widen — one float4 pair for the activations and one char4 pair per
+// quant row instead of sixteen scalar loads per row step.  The decode
+// timeline puts the Q8 matvec stages at ~330 GB/s (~62 % of DRAM peak) with
+// the scalar loads dominating instruction issue; loads do not round, so the
+// outputs are bit-identical to the established kernel.
+template<short NR0, typename args_t>
+void kernel_mul_mv_q8_0_f32_v4_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+
+    const int nb = args.ne00/QK8_0;
+
+    const int r0 = tgpig.x*NR0;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const uint i12 = im%args.ne12;
+    const uint i13 = im/args.ne12;
+
+    const uint64_t offset1 = r1*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
+
+    device const float * y = (device const float *) (src1 + offset1);
+
+    device const block_q8_0 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+
+        ax[row] = (device const block_q8_0 *) ((device char *) src0 + offset0);
+    }
+
+    float sumf[NR0] = { 0.f };
+
+    const short ix = tiisg/(NW/NQ);
+    const short il = tiisg%(NW/NQ);
+
+    const int ib0 = sgitg*NQ + ix;
+
+    device const float * yb = y + ib0*QK8_0 + il*NQ;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+        const float4 yv0 = ((device const float4 *) yb)[0];
+        const float4 yv1 = ((device const float4 *) yb)[1];
+
+        for (short row = 0; row < NR0; row++) {
+            /* block_q8_0 is 34 bytes (half d + 32 qs): qs sits at a 2-byte
+             * offset, so the wide loads must be packed (1-byte-aligned). */
+            device const packed_char4 * qs4 =
+                (device const packed_char4 *)(ax[row][ib].qs + il*NQ);
+            const char4 q0 = char4(qs4[0]);
+            const char4 q1 = char4(qs4[1]);
+
+            float sumq = 0.f;
+            sumq += q0.x * yv0.x;
+            sumq += q0.y * yv0.y;
+            sumq += q0.z * yv0.z;
+            sumq += q0.w * yv0.w;
+            sumq += q1.x * yv1.x;
+            sumq += q1.y * yv1.y;
+            sumq += q1.z * yv1.z;
+            sumq += q1.w * yv1.w;
+
+            sumf[row] += sumq*ax[row][ib].d;
+        }
+
+        yb += NSG*NQ*QK8_0;
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+
+    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+}
+
+[[host_name("kernel_mul_mv_q8_0_f32_v4")]]
+kernel void kernel_mul_mv_q8_0_f32_v4(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_v4_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
 // Decode-time Q8_0 matrix-vector multiply. DS4 uses this for Q8_0 dense
 // projections such as shared experts and output-side small matvecs.
 [[host_name("kernel_mul_mv_q8_0_f32")]]
