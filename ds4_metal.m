@@ -5020,31 +5020,41 @@ static ds4_gpu_mv_dispatch ds4_gpu_make_q8_0_mv_dispatch(void) {
     const uint64_t default_nsg = ds4_gpu_tp_world_is_two() ? 2u : 4u;
     const int16_t nsg =
         (int16_t)ds4_gpu_env_u64("DS4_METAL_Q8_MV_NSG", default_nsg, 1u, 8u);
-    /* Candidate (read per call for the ABBA bench): identical arithmetic
-     * with vectorized loads — the decode timeline puts the scalar-load Q8
-     * matvec at ~62 % of DRAM peak. */
-    const bool vec = getenv("DS4_METAL_Q8_MV_VEC") != NULL;
-    /* Candidate ladder (valued env, read per call): rows per threadgroup —
-     * per-row math identical at every width, only the stream shape changes.
-     * Values 4/8/16/32 select the matching instantiation; NR8 keeps its
-     * boolean env for the bench that only sets =1. */
+    return (ds4_gpu_mv_dispatch) {
+        .function_name = "kernel_mul_mv_q8_0_f32",
+        .nsg = nsg,
+        .nr0 = 2,
+        .smem = 32u * 2u * sizeof(float),
+    };
+}
+
+/* Plain single-matvec dispatch with the candidate ladder (read per call).
+ * ONLY for call sites that dispatch .function_name directly: the pair and
+ * fused gate/up sites run their own kernels but consume .nr0/.smem for grid
+ * geometry, and an override there mis-sizes their dispatch (bit 2026-08-19:
+ * the first NR8 A/B corrupted the pair path and decoded garbage).
+ * DS4_METAL_Q8_MV_VEC = vector-load variant (measured flat, kept for A/B);
+ * DS4_METAL_Q8_MV_NR0=4|8|16|32 = rows per threadgroup — per-row math is
+ * identical at every width, only the stream shape and y-reuse change. */
+static ds4_gpu_mv_dispatch ds4_gpu_make_q8_0_mv_dispatch_plain(void) {
+    ds4_gpu_mv_dispatch d = ds4_gpu_make_q8_0_mv_dispatch();
+    if (getenv("DS4_METAL_Q8_MV_VEC") != NULL) {
+        d.function_name = "kernel_mul_mv_q8_0_f32_v4";
+        return d;
+    }
     const char *nr_env = getenv("DS4_METAL_Q8_MV_NR0");
     uint32_t nr = nr_env ? (uint32_t)strtoul(nr_env, NULL, 10) : 0u;
     if (!nr && getenv("DS4_METAL_Q8_MV_NR8") != NULL) nr = 8u;
-    if (nr != 4u && nr != 8u && nr != 16u && nr != 32u) nr = 0u;
-    const char *nr_name =
-        nr == 4u ? "kernel_mul_mv_q8_0_f32_nr4" :
-        nr == 8u ? "kernel_mul_mv_q8_0_f32_nr8" :
-        nr == 16u ? "kernel_mul_mv_q8_0_f32_nr16" :
-        nr == 32u ? "kernel_mul_mv_q8_0_f32_nr32" : NULL;
-    return (ds4_gpu_mv_dispatch) {
-        .function_name = nr_name ? nr_name :
-                         vec ? "kernel_mul_mv_q8_0_f32_v4"
-                             : "kernel_mul_mv_q8_0_f32",
-        .nsg = nsg,
-        .nr0 = (int32_t)(nr ? nr : 2u),
-        .smem = 32u * (nr ? nr : 2u) * sizeof(float),
-    };
+    switch (nr) {
+    case 4u:  d.function_name = "kernel_mul_mv_q8_0_f32_nr4";  break;
+    case 8u:  d.function_name = "kernel_mul_mv_q8_0_f32_nr8";  break;
+    case 16u: d.function_name = "kernel_mul_mv_q8_0_f32_nr16"; break;
+    case 32u: d.function_name = "kernel_mul_mv_q8_0_f32_nr32"; break;
+    default: return d;
+    }
+    d.nr0 = (int32_t)nr;
+    d.smem = 32u * nr * sizeof(float);
+    return d;
 }
 
 static ds4_gpu_mv_dispatch ds4_gpu_make_plain_mv_dispatch(
@@ -18205,7 +18215,7 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             }
 
             ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
-            ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+            ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch_plain();
             if (out_dim > 65536u) mv_dispatch.nsg = 8;
             mv_args.nr0 = mv_dispatch.nr0;
             id<MTLComputePipelineState> pipeline =
@@ -18945,7 +18955,7 @@ int ds4_gpu_matmul_q8_0_rows_scalar_tensor(
         if (!wbuf) return 0;
 
         ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
-        ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+        ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch_plain();
         if (out_dim > 65536u) mv_dispatch.nsg = 8;
         mv_args.nr0 = mv_dispatch.nr0;
         id<MTLComputePipelineState> pipeline =
@@ -25022,7 +25032,7 @@ int ds4_gpu_matmul_q8_0_kslice_tensor(
         ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(full_in_dim, out_dim);
         mv_args.ne00 = (int32_t)k_cnt;
         mv_args.ne10 = (int32_t)k_cnt;
-        ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+        ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch_plain();
         if (out_dim > 65536u) mv_dispatch.nsg = 8;
         mv_args.nr0 = mv_dispatch.nr0;
         id<MTLComputePipelineState> pipeline =
