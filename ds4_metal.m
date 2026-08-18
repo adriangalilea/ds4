@@ -28709,8 +28709,10 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         const char *attend_rb_env = (!decode_one_token && !split_decode &&
                                      !prefill_dual_heads) ?
             getenv("DS4_METAL_ATTEND_RB") : NULL;
-        const uint32_t attend_rb = attend_rb_env ?
+        const uint32_t attend_rb_raw = attend_rb_env ?
             (uint32_t)strtoul(attend_rb_env, NULL, 10) : 0u;
+        /* "1" (what the variant bench sets) selects the default width */
+        const uint32_t attend_rb = attend_rb_raw == 1u ? 8u : attend_rb_raw;
         const bool prefill_rb = attend_rb == 4u || attend_rb == 8u ||
             attend_rb == 16u;
         if (prefill_rb) {
