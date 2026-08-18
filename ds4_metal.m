@@ -188,6 +188,7 @@ static id<MTLComputePipelineState> g_dsv4_sort_i32_rows_asc_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_rb16_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads16_dual_pipeline;
+static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads64_shared_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_split_pipeline;
 static id<MTLComputePipelineState> g_dsv4_indexed_attention_heads8_split_reduce_pipeline;
 static id<MTLComputePipelineState> g_dsv4_softplus_sqrt_pipeline;
@@ -8422,6 +8423,8 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_dsv4_indexed_mixed_attention_heads8");
         g_dsv4_indexed_attention_heads8_rb16_pipeline =
             ds4_gpu_get_pipeline("kernel_dsv4_indexed_mixed_attention_heads8_rb16");
+        g_dsv4_indexed_attention_heads64_shared_pipeline =
+            ds4_gpu_get_pipeline("kernel_dsv4_indexed_mixed_attention_heads64_shared");
         g_dsv4_indexed_attention_heads16_dual_pipeline =
             ds4_gpu_get_pipeline("kernel_dsv4_indexed_mixed_attention_heads16_dual");
         g_dsv4_indexed_attention_heads8_split_pipeline =
@@ -8569,6 +8572,7 @@ int ds4_gpu_init(void) {
             !g_dsv4_indexed_attention_heads8_pipeline ||
             !g_dsv4_indexed_attention_heads8_rb16_pipeline ||
             !g_dsv4_indexed_attention_heads16_dual_pipeline ||
+            !g_dsv4_indexed_attention_heads64_shared_pipeline ||
             !g_dsv4_indexed_attention_heads8_split_pipeline ||
             !g_dsv4_indexed_attention_heads8_split_reduce_pipeline ||
             !g_dsv4_softplus_sqrt_pipeline ||
@@ -10304,6 +10308,7 @@ void ds4_gpu_cleanup(void) {
         g_dsv4_indexed_attention_heads8_pipeline = nil;
         g_dsv4_indexed_attention_heads8_rb16_pipeline = nil;
         g_dsv4_indexed_attention_heads16_dual_pipeline = nil;
+        g_dsv4_indexed_attention_heads64_shared_pipeline = nil;
         g_dsv4_indexed_attention_heads8_split_pipeline = nil;
         g_dsv4_indexed_attention_heads8_split_reduce_pipeline = nil;
         g_dsv4_softplus_sqrt_pipeline = nil;
@@ -28627,6 +28632,23 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             !decode_one_token && !g_quality_mode && ds4_gpu_mpp_available() &&
             n_head == 64u &&
             top_k == 512u && window == 128u && head_dim == 512u;
+        /* Pre-M5 prefill default: stage every K/V row once for all 64 heads
+         * (one 1024-thread threadgroup per token) instead of once per 8-head
+         * group. Bit-identical row order and softmax sequence; 8x fewer
+         * device fetches, which is what the attend stage pays for once the
+         * compressed cache outgrows the cache hierarchy at long context.
+         * DS4_METAL_DISABLE_PRE_M5_INDEXED_ATTN_SHARED64 rolls back. */
+        static int prefill_shared64_default = -1;
+        if (prefill_shared64_default < 0) {
+            prefill_shared64_default =
+                !ds4_gpu_mpp_available() &&
+                getenv("DS4_METAL_DISABLE_PRE_M5_INDEXED_ATTN_SHARED64") == NULL;
+        }
+        const bool prefill_shared64 =
+            !decode_one_token && !prefill_dual_heads &&
+            prefill_shared64_default != 0 && n_head == 64u &&
+            g_dsv4_indexed_attention_heads64_shared_pipeline != nil &&
+            g_dsv4_indexed_attention_heads64_shared_pipeline.maxTotalThreadsPerThreadgroup >= 1024;
         const uint32_t decode_splits =
             decode_one_token && !g_quality_mode ? 12u : 1u;
         const bool split_decode = decode_splits > 1u;
@@ -28638,6 +28660,9 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             decode_one_token ?
             ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads8_rb16_pipeline,
                                    "kernel_dsv4_indexed_mixed_attention_heads8_rb16") :
+            prefill_shared64 ?
+            ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads64_shared_pipeline,
+                                   "kernel_dsv4_indexed_mixed_attention_heads64_shared") :
             prefill_dual_heads ?
             ds4_gpu_hot_pipeline(g_dsv4_indexed_attention_heads16_dual_pipeline,
                                    "kernel_dsv4_indexed_mixed_attention_heads16_dual") :
@@ -28775,15 +28800,20 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                  atIndex:4];
             [enc setBuffer:sinks_buf offset:(NSUInteger)sinks_inner atIndex:5];
             [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:6];
-            [enc setThreadgroupMemoryLength:(decode_one_token ? 16u : 1u) *
+            [enc setThreadgroupMemoryLength:((decode_one_token || prefill_shared64) ? 16u : 1u) *
                                             128u * 4u * sizeof(uint16_t)
                                     atIndex:0];
-            [enc dispatchThreadgroups:
-                    MTLSizeMake((NSUInteger)n_tokens,
-                                ((NSUInteger)n_head + (prefill_dual_heads ? 15u : 7u)) /
-                                    (prefill_dual_heads ? 16u : 8u),
-                                1)
-                 threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+            if (prefill_shared64) {
+                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(32, 32, 1)];
+            } else {
+                [enc dispatchThreadgroups:
+                        MTLSizeMake((NSUInteger)n_tokens,
+                                    ((NSUInteger)n_head + (prefill_dual_heads ? 15u : 7u)) /
+                                        (prefill_dual_heads ? 16u : 8u),
+                                    1)
+                     threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+            }
             ds4_gpu_end_compute_encoder(cb, enc);
         }
 
