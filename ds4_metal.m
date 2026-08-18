@@ -17564,13 +17564,12 @@ static int ds4_gpu_indexer_scores_batch_tensor(
          * staging, applied once instead of once per head per comp tile), then
          * TN=64 tiles.  Bit-identical scores; the dominant Q re-read traffic
          * drops ~4x.  DS4_METAL_DISABLE_INDEXER_SCORES_TILED2 rolls back. */
-        static int tiled2_default = -1;
-        if (tiled2_default < 0) {
-            tiled2_default =
-                getenv("DS4_METAL_DISABLE_INDEXER_SCORES_TILED2") == NULL;
-        }
+        /* Read the rollback env per call: the ABBA variant bench toggles it
+         * between runs inside one process, and a cached read would silently
+         * compare the candidate against itself. */
         const bool use_tiled2 = !use_nax && !g_quality_mode &&
-            n_tokens >= 32u && tiled2_default != 0;
+            n_tokens >= 32u &&
+            getenv("DS4_METAL_DISABLE_INDEXER_SCORES_TILED2") == NULL;
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
             use_nax ? "kernel_dsv4_indexer_scores_nax" :
             (g_quality_mode ? "kernel_dsv4_indexer_scores_tiled_f32" :
