@@ -996,7 +996,17 @@ static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer>
     if (g_batch_cb && cb == g_batch_cb) {
         g_batch_has_work = YES;
         if (!g_batch_enc) {
-            g_batch_enc = g_batch_encoder_concurrent
+            /* Experiment env, read per call for the ABBA bench: run every
+             * batch encoder with MTLDispatchTypeConcurrent and let tracked
+             * hazards order the dispatches.  Independent weight streams
+             * inside a decode layer (q/kv/router/compressor fed by one norm,
+             * the two HC expands, shared vs routed FFN) may then overlap;
+             * every non-model buffer is hazard-tracked, so ordering stays
+             * correct by construction.  The armed parallel-FFN path composes:
+             * with an encoder already open it reuses it. */
+            const bool concurrent = g_batch_encoder_concurrent ||
+                getenv("DS4_METAL_CONCURRENT_BATCH_ENCODER") != NULL;
+            g_batch_enc = concurrent
                 ? [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]
                 : [cb computeCommandEncoder];
             if (ds4_gpu_census_on()) g_census_encoders++;
