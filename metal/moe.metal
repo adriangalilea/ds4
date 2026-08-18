@@ -8506,6 +8506,11 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl(
     const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
     const short nr1 = (    neh1 - r1 < NR1) ? (    neh1 - r1) : NR1;
     const bool mma_active = 16*(short)sgitg < nr1;
+    /* Second 8-row half of this SIMDgroup's B tile: skip its load, MMAs and
+     * stores when those rows are all beyond nr1.  Skipped work only feeds
+     * rows the SwiGLU store loop (j < nr1) never reads, so outputs are
+     * unchanged. */
+    const bool mma_b1 = 16*(short)sgitg + 8 < nr1;
 
     const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1;
     const short row_b0 = (short)tiitg/NL1;
@@ -8605,15 +8610,22 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl(
                     simdgroup_load(ma_g[i], lsma_gate + 64*i, 8, 0, false);
                     simdgroup_load(ma_u[i], lsma_up   + 64*i, 8, 0, false);
                 }
-                FOR_UNROLL (short i = 0; i < 2; i++) {
-                    simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
+                simdgroup_load(mb[0], lsmb, 8, 0, false);
+                if (mma_b1) {
+                    simdgroup_load(mb[1], lsmb + 64, 8, 0, false);
                 }
 
                 simdgroup_barrier(mem_flags::mem_none);
 
-                FOR_UNROLL (short i = 0; i < 8; i++) {
-                    simdgroup_multiply_accumulate(mc_gate[i], mb[i/4], ma_g[i%4], mc_gate[i]);
-                    simdgroup_multiply_accumulate(mc_up[i],   mb[i/4], ma_u[i%4], mc_up[i]);
+                FOR_UNROLL (short i = 0; i < 4; i++) {
+                    simdgroup_multiply_accumulate(mc_gate[i], mb[0], ma_g[i], mc_gate[i]);
+                    simdgroup_multiply_accumulate(mc_up[i],   mb[0], ma_u[i], mc_up[i]);
+                }
+                if (mma_b1) {
+                    FOR_UNROLL (short i = 4; i < 8; i++) {
+                        simdgroup_multiply_accumulate(mc_gate[i], mb[1], ma_g[i%4], mc_gate[i]);
+                        simdgroup_multiply_accumulate(mc_up[i],   mb[1], ma_u[i%4], mc_up[i]);
+                    }
                 }
 
                 lsma_gate += 4*64;
@@ -8637,7 +8649,8 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl(
     threadgroup float * temp_up_str = temp_up + 16*sgitg*NR0;
 
     if (mma_active) {
-        for (short i = 0; i < 8; i++) {
+        const short n_store = mma_b1 ? 8 : 4;
+        for (short i = 0; i < n_store; i++) {
             simdgroup_store(mc_gate[i], temp_gate_str + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
             simdgroup_store(mc_up[i],   temp_up_str   + 8*(i%4) + 8*NR0*(i/4), NR0, 0, false);
         }
