@@ -5838,6 +5838,11 @@ kernel void kernel_dsv4_indexed_mixed_attention_heads8_rb16(
 // heads. Row order and the per-head online-softmax sequence are identical to
 // kernel_dsv4_indexed_mixed_attention_heads8, so the outputs are
 // bit-identical; only the number of device fetches changes.
+// max_total_threads_per_threadgroup guarantees the pipeline admits the full
+// 1024-thread dispatch (the compiler constrains per-thread resources to fit).
+// On Apple9 the register file is a dynamically allocated cache, so the
+// guarantee no longer implies the pre-M3 spill penalty.
+[[max_total_threads_per_threadgroup(1024)]]
 kernel void kernel_dsv4_indexed_mixed_attention_heads64_shared(
         constant ds4_metal_args_dsv4_indexed_attention & args,
         device const char *q,
