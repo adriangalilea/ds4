@@ -11843,6 +11843,8 @@ void ds4_gpu_cleanup(void) {
         g_indexer_head_scores_buffer = nil;
         g_indexer_topk_buffer = nil;
         g_indexed_topk_buffer = nil;
+        g_indexer_q16_buffer = nil;
+        g_indexer_k16_buffer = nil;
         g_stream_expert_validate_status_buffer = nil;
         g_f16_round_scratch_buffer = nil;
         g_raw_store_round_buffer = nil;
@@ -11887,6 +11889,8 @@ void ds4_gpu_cleanup(void) {
         g_indexer_head_scores_bytes = 0;
         g_indexer_topk_bytes = 0;
         g_indexed_topk_bytes = 0;
+        g_indexer_q16_bytes = 0;
+        g_indexer_k16_bytes = 0;
         g_f16_round_scratch_bytes = 0;
         g_raw_store_round_bytes = 0;
         g_moe_gate_scratch_bytes = 0;
