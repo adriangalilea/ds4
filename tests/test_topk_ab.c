@@ -1,136 +1,214 @@
-/* Standalone A/B for the indexer top-k: the canonical argsort path and the
- * stream512 selector must produce byte-identical index lists (same
- * (score desc, idx asc) total order).  Random scores with duplicate values
- * and a -inf tail exercise ties and the visibility pattern. */
-#include <math.h>
+/* Standalone exactness regression for the Metal indexer top-k paths.
+ *
+ * The final #832 defaults are canonical argsort and, for top_k=512 with at
+ * least 32 tokens, stream512.  Compare those actual final paths directly and
+ * require both to match a CPU (score descending, index ascending) reference.
+ * Cases cover dispatch gates, odd row widths, visibility below top_k, dense
+ * finite ties, and a 64K-context-sized compressed frontier.
+ */
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
 #include "ds4_gpu.h"
 
-#define CHECK(cond, msg) do { \
-    if (!(cond)) { fprintf(stderr, "FAIL: %s\n", msg); return 1; } \
-} while (0)
+typedef struct {
+    const char *name;
+    uint32_t n_comp;
+    uint32_t n_tokens;
+    uint32_t top_k;
+    uint32_t visible_base;
+    uint32_t visible_step;
+    uint32_t score_modulus;
+} topk_case;
 
 static const float *g_row;
+
 static int cmp_desc_idx(const void *x, const void *y) {
-    const uint32_t ix = *(const uint32_t *)x, iy = *(const uint32_t *)y;
+    const uint32_t ix = *(const uint32_t *)x;
+    const uint32_t iy = *(const uint32_t *)y;
     if (g_row[ix] > g_row[iy]) return -1;
     if (g_row[ix] < g_row[iy]) return 1;
-    return ix < iy ? -1 : 1;
+    if (ix < iy) return -1;
+    if (ix > iy) return 1;
+    return 0;
+}
+
+static uint32_t next_random(uint32_t *state) {
+    *state = *state * UINT32_C(1664525) + UINT32_C(1013904223);
+    return *state;
+}
+
+static float negative_infinity(void) {
+    const uint32_t bits = UINT32_C(0xff800000);
+    float value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static int select_canonical(void) {
+    return unsetenv("DS4_METAL_DISABLE_ARGSORT_CANON") == 0 &&
+           setenv("DS4_METAL_DISABLE_TOPK_STREAM512", "1", 1) == 0;
+}
+
+static int select_default(void) {
+    return unsetenv("DS4_METAL_DISABLE_ARGSORT_CANON") == 0 &&
+           unsetenv("DS4_METAL_DISABLE_TOPK_STREAM512") == 0;
+}
+
+static int first_difference(
+        const int32_t *expected,
+        const int32_t *observed,
+        size_t count,
+        size_t *first,
+        size_t *different) {
+    *first = 0;
+    *different = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (expected[i] != observed[i]) {
+            if ((*different)++ == 0) *first = i;
+        }
+    }
+    return *different != 0;
+}
+
+static int run_case(const topk_case *tc) {
+    const size_t score_count = (size_t)tc->n_comp * tc->n_tokens;
+    const size_t selected_count = (size_t)tc->top_k * tc->n_tokens;
+    const float ninf = negative_infinity();
+    float *host_scores = NULL;
+    int32_t *canonical = NULL, *actual = NULL, *reference = NULL;
+    uint32_t *order = NULL;
+    ds4_gpu_tensor *scores = NULL, *selected = NULL;
+    int rc = 1;
+
+    host_scores = malloc(score_count * sizeof(*host_scores));
+    canonical = malloc(selected_count * sizeof(*canonical));
+    actual = malloc(selected_count * sizeof(*actual));
+    reference = malloc(selected_count * sizeof(*reference));
+    order = malloc((size_t)tc->n_comp * sizeof(*order));
+    if (!host_scores || !canonical || !actual || !reference || !order) {
+        fprintf(stderr, "FAIL %s: host allocation\n", tc->name);
+        goto done;
+    }
+
+    uint32_t random_state = UINT32_C(0x9e3779b9) ^ tc->n_comp ^
+                            tc->n_tokens ^ tc->top_k;
+    for (uint32_t token = 0; token < tc->n_tokens; token++) {
+        uint64_t visible_wide = (uint64_t)tc->visible_base +
+                                (uint64_t)token * tc->visible_step;
+        const uint32_t visible = visible_wide < tc->n_comp
+            ? (uint32_t)visible_wide : tc->n_comp;
+        for (uint32_t comp = 0; comp < tc->n_comp; comp++) {
+            host_scores[(size_t)token * tc->n_comp + comp] = comp < visible
+                ? (float)(next_random(&random_state) % tc->score_modulus) / 8.0f
+                : ninf;
+        }
+    }
+
+    scores = ds4_gpu_tensor_alloc(score_count * sizeof(float));
+    selected = ds4_gpu_tensor_alloc(selected_count * sizeof(int32_t));
+    if (!scores || !selected ||
+        !ds4_gpu_tensor_write(scores, 0, host_scores,
+                              score_count * sizeof(float))) {
+        fprintf(stderr, "FAIL %s: GPU allocation/write\n", tc->name);
+        goto done;
+    }
+
+    memset(canonical, 0x31, selected_count * sizeof(*canonical));
+    if (!select_canonical() ||
+        !ds4_gpu_tensor_write(selected, 0, canonical,
+                              selected_count * sizeof(*canonical)) ||
+        !ds4_gpu_indexer_topk_tensor(selected, scores, tc->n_comp,
+                                     tc->n_tokens, tc->top_k) ||
+        !ds4_gpu_tensor_read(selected, 0, canonical,
+                             selected_count * sizeof(*canonical))) {
+        fprintf(stderr, "FAIL %s: canonical dispatch/read\n", tc->name);
+        goto done;
+    }
+
+    memset(actual, 0x73, selected_count * sizeof(*actual));
+    if (!select_default() ||
+        !ds4_gpu_tensor_write(selected, 0, actual,
+                              selected_count * sizeof(*actual)) ||
+        !ds4_gpu_indexer_topk_tensor(selected, scores, tc->n_comp,
+                                     tc->n_tokens, tc->top_k) ||
+        !ds4_gpu_tensor_read(selected, 0, actual,
+                             selected_count * sizeof(*actual))) {
+        fprintf(stderr, "FAIL %s: default dispatch/read\n", tc->name);
+        goto done;
+    }
+
+    for (uint32_t token = 0; token < tc->n_tokens; token++) {
+        g_row = host_scores + (size_t)token * tc->n_comp;
+        for (uint32_t comp = 0; comp < tc->n_comp; comp++) order[comp] = comp;
+        qsort(order, tc->n_comp, sizeof(*order), cmp_desc_idx);
+        for (uint32_t rank = 0; rank < tc->top_k; rank++) {
+            reference[(size_t)token * tc->top_k + rank] =
+                (int32_t)order[rank];
+        }
+    }
+
+    size_t first = 0, different = 0;
+    if (first_difference(reference, canonical, selected_count,
+                         &first, &different)) {
+        fprintf(stderr,
+                "FAIL %s: canonical differs from CPU at %zu/%zu entries; "
+                "first token=%zu rank=%zu expected=%d observed=%d\n",
+                tc->name, different, selected_count, first / tc->top_k,
+                first % tc->top_k, reference[first], canonical[first]);
+        goto done;
+    }
+    if (first_difference(reference, actual, selected_count,
+                         &first, &different)) {
+        fprintf(stderr,
+                "FAIL %s: default differs from CPU at %zu/%zu entries; "
+                "first token=%zu rank=%zu expected=%d observed=%d\n",
+                tc->name, different, selected_count, first / tc->top_k,
+                first % tc->top_k, reference[first], actual[first]);
+        goto done;
+    }
+
+    fprintf(stderr, "PASS %s: canonical/default/CPU identical (%zu entries)\n",
+            tc->name, selected_count);
+    rc = 0;
+
+done:
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(scores);
+    free(order);
+    free(reference);
+    free(actual);
+    free(canonical);
+    free(host_scores);
+    return rc;
 }
 
 int main(void) {
-    CHECK(ds4_gpu_init(), "init");
-    #define ENVU(name, dflt) (getenv(name) ? (uint32_t)strtoul(getenv(name), NULL, 10) : (dflt))
-    const uint32_t n_comp = ENVU("NC", 16384u), n_tokens = ENVU("NT", 64u), top_k = 512u;
-    const size_t sc = (size_t)n_comp * n_tokens;
-    float *hs = malloc(sc * 4);
-    int32_t *a = malloc((size_t)top_k * n_tokens * 4);
-    int32_t *b = malloc((size_t)top_k * n_tokens * 4);
-    CHECK(hs && a && b, "host alloc");
-    srand(99);
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        /* visible prefix grows with t; some tokens have visible < top_k */
-        const uint32_t visible = getenv("VIS")
-            ? (uint32_t)strtoul(getenv("VIS"), NULL, 10)
-            : 300u + t * 251u;
-        for (uint32_t c = 0; c < n_comp; c++) {
-            /* coarse quantized scores -> plenty of exact ties */
-            hs[(size_t)t * n_comp + c] = c < visible
-                ? (float)(rand() % (getenv("FINE") ? 1000000 : 97)) / 8.0f
-                : -INFINITY;
-        }
-    }
-    ds4_gpu_tensor *scores = ds4_gpu_tensor_alloc(sc * 4);
-    ds4_gpu_tensor *sel = ds4_gpu_tensor_alloc((size_t)top_k * n_tokens * 4);
-    CHECK(scores && sel, "gpu alloc");
-    CHECK(ds4_gpu_tensor_write(scores, 0, hs, sc * 4), "write");
+    static const topk_case cases[] = {
+        {"below-token-gate", 1024u, 31u, 512u, 300u, 17u, 97u},
+        {"token-gate", 1025u, 32u, 512u, 511u, 1u, 97u},
+        {"minimum-stream-row", 512u, 32u, 512u, 512u, 0u, 17u},
+        {"odd-row-width", 2053u, 33u, 512u, 400u, 37u, 97u},
+        {"dense-finite-ties", 4099u, 40u, 512u, 4099u, 0u, 7u},
+        {"64k-compressed-frontier", 16387u, 64u, 512u, 300u, 251u, 97u},
+        {"non-512-fallback", 1025u, 32u, 511u, 700u, 0u, 17u},
+    };
 
-    setenv("DS4_METAL_ARGSORT_CANON", "1", 1);
-    unsetenv("DS4_METAL_TOPK_STREAM512");
-    CHECK(ds4_gpu_indexer_topk_tensor(sel, scores, n_comp, n_tokens, top_k), "canon topk");
-    CHECK(ds4_gpu_tensor_read(sel, 0, a, (size_t)top_k * n_tokens * 4), "read a");
-
-    setenv("DS4_METAL_TOPK_STREAM512", "1", 1);
-    CHECK(ds4_gpu_indexer_topk_tensor(sel, scores, n_comp, n_tokens, top_k), "stream topk");
-    CHECK(ds4_gpu_tensor_read(sel, 0, b, (size_t)top_k * n_tokens * 4), "read b");
-
-    /* CPU ground truth: strict (score desc, idx asc) top-k per row */
-    int32_t *ref = malloc((size_t)top_k * n_tokens * 4);
-    uint32_t *ord = malloc((size_t)n_comp * 4);
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        g_row = hs + (size_t)t * n_comp;
-        for (uint32_t c = 0; c < n_comp; c++) ord[c] = c;
-        qsort(ord, n_comp, 4, cmp_desc_idx);
-        for (uint32_t k = 0; k < top_k; k++)
-            ref[(size_t)t * top_k + k] = (int32_t)ord[k];
-    }
-    size_t da = 0, db_ = 0;
-    for (size_t i = 0; i < (size_t)top_k * n_tokens; i++) {
-        if (a[i] != ref[i]) da++;
-        if (b[i] != ref[i]) db_++;
-    }
-    fprintf(stderr, "vs cpu-ref: canon-argsort diffs=%zu stream512 diffs=%zu\n", da, db_);
-
-    if (getenv("DUMP")) {
-        fprintf(stderr, "t0 canon:  ");
-        for (int k = 0; k < 8; k++) fprintf(stderr, "%d ", a[k]);
-        fprintf(stderr, "\nt0 stream: ");
-        for (int k = 0; k < 8; k++) fprintf(stderr, "%d ", b[k]);
-        fprintf(stderr, "\nt0 stream scores: ");
-        for (int k = 0; k < 8; k++) fprintf(stderr, "%.1f ", b[k] >= 0 && (uint32_t)b[k] < n_comp ? hs[b[k]] : -1.0f);
-        fprintf(stderr, "\n");
-    }
-    size_t diff = 0, first = (size_t)-1;
-    for (size_t i = 0; i < (size_t)top_k * n_tokens; i++)
-        if (a[i] != b[i]) { if (first == (size_t)-1) first = i; diff++; }
-    if (diff) {
-        const size_t ft = first / top_k;
-        fprintf(stderr, "FAIL: %zu/%zu differ; first@%zu (t=%zu k=%zu) canon=%d stream=%d\n",
-                diff, (size_t)top_k * n_tokens, first, ft, first % top_k,
-                a[first], b[first]);
-        /* set diagnosis for the failing token */
-        size_t missing = 0, extra = 0;
-        for (uint32_t k = 0; k < top_k; k++) {
-            const int32_t want = a[ft * top_k + k];
-            int found = 0;
-            for (uint32_t j = 0; j < top_k; j++)
-                if (b[ft * top_k + j] == want) { found = 1; break; }
-            if (!found) {
-                if (missing < 4)
-                    fprintf(stderr, "  missing from stream: idx=%d score=%f rank=%u\n",
-                            want, hs[ft * n_comp + want], k);
-                missing++;
-            }
-        }
-        for (uint32_t k = 0; k < top_k; k++) {
-            const int32_t got = b[ft * top_k + k];
-            int found = 0;
-            for (uint32_t j = 0; j < top_k; j++)
-                if (a[ft * top_k + j] == got) { found = 1; break; }
-            if (!found) {
-                if (extra < 4)
-                    fprintf(stderr, "  extra in stream: idx=%d score=%f rank=%u\n",
-                            got, got >= 0 && (uint32_t)got < n_comp ? hs[ft * n_comp + got] : -999.0f, k);
-                extra++;
-            }
-        }
-        fprintf(stderr, "  token %zu: missing=%zu extra=%zu (of %u)\n", ft, missing, extra, top_k);
-        /* duplicate detection in the stream list */
-        size_t dups = 0;
-        for (uint32_t k = 0; k < top_k; k++)
-            for (uint32_t j = k + 1; j < top_k; j++)
-                if (b[ft * top_k + k] == b[ft * top_k + j]) {
-                    if (dups < 5)
-                        fprintf(stderr, "  dup: idx=%d at ranks %u and %u\n",
-                                b[ft * top_k + k], k, j);
-                    dups++;
-                }
-        fprintf(stderr, "  dups=%zu\n", dups);
+    if (!ds4_gpu_init()) {
+        fprintf(stderr, "FAIL: GPU init\n");
         return 1;
     }
-    fprintf(stderr, "topk stream512 vs canon: %u x %u identical\n", n_tokens, top_k);
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        if (run_case(&cases[i]) != 0) {
+            ds4_gpu_cleanup();
+            return 1;
+        }
+    }
     ds4_gpu_cleanup();
+    unsetenv("DS4_METAL_DISABLE_ARGSORT_CANON");
+    unsetenv("DS4_METAL_DISABLE_TOPK_STREAM512");
+    fprintf(stderr, "PASS: all indexer top-k regressions\n");
     return 0;
 }
