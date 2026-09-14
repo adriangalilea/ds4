@@ -3075,6 +3075,13 @@ static ds4_support_kind support_model_detect(
 }
 
 static bool support_model_checkpoint_compatible(const ds4_model *m) {
+    ds4_str architecture = {0};
+    const bool v41 = model_get_string(m, "general.architecture", &architecture) &&
+        ds4_streq(architecture, "deepseek41-dspark");
+    if (v41 != (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41)) {
+        fprintf(stderr, "ds4: DSpark support and target architectures do not match\n");
+        return false;
+    }
     static const char vision_exp_revision[] =
         "e46e16bf6035c6f317eb2ac7458eb0362926d402";
     ds4_str variant = {0};
@@ -4501,6 +4508,8 @@ typedef struct {
     uint32_t block_size;
     uint32_t markov_rank;
     uint32_t noise_token_id;
+    uint32_t n_expert, n_expert_used, sliding_window;
+    bool v41;
     uint32_t target_layer_count;
     uint32_t target_layers[DS4_DSPARK_MAX_TARGET_LAYERS];
     uint32_t present_tensors;
@@ -5707,6 +5716,11 @@ static void dspark_weights_note_metadata_error(
 
 static void dspark_weights_validate_metadata(ds4_dspark_weights *dw) {
     if (!dw) return;
+    if (dw->v41 && (dw->n_stages != 3 || dw->block_size != 5 ||
+        dw->markov_rank != 256 || dw->n_expert != 128 || dw->n_expert_used != 3 ||
+        dw->sliding_window != 128 || dw->target_layer_count != 3)) {
+        dspark_weights_note_metadata_error(dw, "unsupported V4.1 drafter configuration");
+    }
     if (!dw->has_block_size || dw->block_size == 0) {
         dspark_weights_note_metadata_error(dw, "missing or zero block size");
     } else if (dw->block_size > DS4_DSPARK_MAX_BLOCK_SIZE) {
@@ -5794,19 +5808,24 @@ static void dspark_weights_validate_block_layout(
                                   DS4_N_EMBD, 0, 0);
     dspark_validate_tensor_layout(dw, l->ffn_gate_inp, "ffn_gate_inp",
                                   DS4_DSPARK_LAYOUT_DENSE, 2,
-                                  DS4_N_EMBD, DS4_N_EXPERT, 0);
+                                  DS4_N_EMBD, dw->n_expert, 0);
     dspark_validate_tensor_layout(dw, l->ffn_exp_probs_b, "exp_probs_b",
                                   DS4_DSPARK_LAYOUT_F32, 1,
-                                  DS4_N_EXPERT, 0, 0);
+                                  dw->n_expert, 0, 0);
+    if (dw->v41) {
+        dspark_validate_tensor_layout(dw, l->ffn_exp_probs_vl, "exp_probs_vl",
+                                      DS4_DSPARK_LAYOUT_F32, 1,
+                                      dw->n_expert, 0, 0);
+    }
     dspark_validate_tensor_layout(dw, l->ffn_gate_exps, "ffn_gate_exps",
                                   DS4_DSPARK_LAYOUT_ROUTED, 3,
-                                  DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+                                  DS4_N_EMBD, DS4_N_FF_EXP, dw->n_expert);
     dspark_validate_tensor_layout(dw, l->ffn_up_exps, "ffn_up_exps",
                                   DS4_DSPARK_LAYOUT_ROUTED, 3,
-                                  DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+                                  DS4_N_EMBD, DS4_N_FF_EXP, dw->n_expert);
     dspark_validate_tensor_layout(dw, l->ffn_down_exps, "ffn_down_exps",
                                   DS4_DSPARK_LAYOUT_ROUTED, 3,
-                                  DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+                                  DS4_N_FF_EXP, DS4_N_EMBD, dw->n_expert);
     if (l->ffn_gate_exps &&
         l->ffn_up_exps &&
         l->ffn_gate_exps->type != l->ffn_up_exps->type) {
@@ -5849,15 +5868,17 @@ static void dspark_weights_validate_layout(ds4_dspark_weights *dw) {
     dspark_validate_tensor_layout(dw, final->norm, "norm",
                                   DS4_DSPARK_LAYOUT_F32, 1,
                                   DS4_N_EMBD, 0, 0);
-    dspark_validate_tensor_layout(dw, final->hc_head_base, "hc_head_base",
-                                  DS4_DSPARK_LAYOUT_F32, 1,
-                                  DS4_N_HC, 0, 0);
-    dspark_validate_tensor_layout(dw, final->hc_head_fn, "hc_head_fn",
-                                  DS4_DSPARK_LAYOUT_PLAIN, 2,
-                                  (uint64_t)DS4_N_EMBD * DS4_N_HC,
-                                  DS4_N_HC, 0);
-    dspark_validate_tensor_layout(dw, final->hc_head_scale, "hc_head_scale",
-                                  DS4_DSPARK_LAYOUT_F32, 1, 1, 0, 0);
+    if (!dw->v41) {
+        dspark_validate_tensor_layout(dw, final->hc_head_base, "hc_head_base",
+                                      DS4_DSPARK_LAYOUT_F32, 1,
+                                      DS4_N_HC, 0, 0);
+        dspark_validate_tensor_layout(dw, final->hc_head_fn, "hc_head_fn",
+                                      DS4_DSPARK_LAYOUT_PLAIN, 2,
+                                      (uint64_t)DS4_N_EMBD * DS4_N_HC,
+                                      DS4_N_HC, 0);
+        dspark_validate_tensor_layout(dw, final->hc_head_scale, "hc_head_scale",
+                                      DS4_DSPARK_LAYOUT_F32, 1, 1, 0, 0);
+    }
     dspark_validate_tensor_layout(dw, final->markov_w1, "markov_w1",
                                   DS4_DSPARK_LAYOUT_DENSE, 2,
                                   dw->markov_rank, DS4_N_VOCAB, 0);
@@ -7809,6 +7830,8 @@ static void dspark_bind_block(
     l->ffn_norm        = dspark_bind_tensor(dw, m, stage, "ffn_norm.weight", true);
     l->ffn_gate_inp    = dspark_bind_tensor(dw, m, stage, "ffn_gate_inp.weight", true);
     l->ffn_exp_probs_b = dspark_bind_tensor(dw, m, stage, "exp_probs_b.bias", true);
+    if (dw->v41)
+        l->ffn_exp_probs_vl = dspark_bind_tensor(dw, m, stage, "exp_probs_vl.bias", true);
     l->ffn_gate_exps   = dspark_bind_tensor(dw, m, stage, "ffn_gate_exps.weight", true);
     l->ffn_up_exps     = dspark_bind_tensor(dw, m, stage, "ffn_up_exps.weight", true);
     l->ffn_down_exps   = dspark_bind_tensor(dw, m, stage, "ffn_down_exps.weight", true);
@@ -7824,8 +7847,27 @@ static void dspark_weights_bind_optional(
     memset(dw, 0, sizeof(*dw));
     if (!m || !summary) return;
 
+    ds4_str architecture = {0};
+    dw->v41 = model_get_string(m, "general.architecture", &architecture) &&
+        ds4_streq(architecture, "deepseek41-dspark");
+    dw->n_expert = DS4_N_EXPERT;
+    dw->n_expert_used = DS4_N_EXPERT_USED;
+    dw->sliding_window = DS4_N_SWA;
+    if (dw->v41) {
+        if (!model_get_u32(m, "dspark.expert_count", &dw->n_expert) ||
+            !model_get_u32(m, "dspark.expert_used_count", &dw->n_expert_used) ||
+            !model_get_u32(m, "dspark.sliding_window", &dw->sliding_window)) {
+            dspark_weights_note_metadata_error(dw, "missing V4.1 expert or window metadata");
+        }
+    }
+
     dw->n_stages = summary->stages < DS4_DSPARK_MAX_STAGES ?
                    summary->stages : DS4_DSPARK_MAX_STAGES;
+    if (dw->v41) {
+        uint32_t stages = 0;
+        if (!model_get_u32(m, "dspark.stage_count", &stages) || stages != dw->n_stages)
+            dspark_weights_note_metadata_error(dw, "V4.1 stage count does not match tensors");
+    }
     dw->block_size = summary->block_size;
     dw->markov_rank = summary->markov_rank;
     dw->noise_token_id = summary->noise_token_id;
@@ -7852,12 +7894,14 @@ static void dspark_weights_bind_optional(
         const uint32_t final_stage = dw->n_stages - 1u;
         ds4_dspark_stage_weights *sw = &dw->stage[final_stage];
         sw->norm = dspark_bind_tensor(dw, m, final_stage, "norm.weight", true);
-        sw->hc_head_base =
-            dspark_bind_tensor(dw, m, final_stage, "hc_head_base.weight", true);
-        sw->hc_head_fn =
-            dspark_bind_tensor(dw, m, final_stage, "hc_head_fn.weight", true);
-        sw->hc_head_scale =
-            dspark_bind_tensor(dw, m, final_stage, "hc_head_scale.weight", true);
+        if (!dw->v41) {
+            sw->hc_head_base =
+                dspark_bind_tensor(dw, m, final_stage, "hc_head_base.weight", true);
+            sw->hc_head_fn =
+                dspark_bind_tensor(dw, m, final_stage, "hc_head_fn.weight", true);
+            sw->hc_head_scale =
+                dspark_bind_tensor(dw, m, final_stage, "hc_head_scale.weight", true);
+        }
         sw->markov_w1 =
             dspark_bind_tensor(dw, m, final_stage, "markov_head.markov_w1.weight", true);
         sw->markov_w2 =

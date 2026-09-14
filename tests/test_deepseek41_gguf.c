@@ -134,7 +134,41 @@ static void check_model_layout(const char *path) {
     puts("V4.1 complete model layout: PASS");
 }
 
+static void check_dspark_layout(const char *path) {
+    ds4_model m;
+    model_open(&m, path, false, false);
+    g_ds4_shape = DS4_SHAPE_FLASH41;
+    assert(support_model_checkpoint_compatible(&m));
+    ds4_dspark_summary summary = {0};
+    uint32_t stages = 0;
+    assert(support_model_detect(&m, &stages, &summary) == DS4_SUPPORT_DSPARK);
+    assert(stages == 3);
+    ds4_dspark_weights dw;
+    dspark_weights_bind_optional(&dw, &m, &summary);
+    assert(dw.v41 && dw.present_tensors == 81);
+    assert(!dw.missing_tensors && !dw.invalid_tensors && !dw.metadata_errors);
+    assert(dw.n_expert == 128 && dw.n_expert_used == 3 && dw.sliding_window == 128);
+    assert(!dw.stage[2].hc_head_fn && !dw.stage[2].hc_head_base && !dw.stage[2].hc_head_scale);
+    ds4_tensor *experts = dw.stage[1].block.ffn_gate_exps;
+    const uint64_t expert_count = experts->dim[2];
+    experts->dim[2] = 384;
+    dspark_weights_bind_optional(&dw, &m, &summary);
+    assert(dw.invalid_tensors == 1);
+    experts->dim[2] = expert_count;
+    summary.block_size = 6;
+    dspark_weights_bind_optional(&dw, &m, &summary);
+    assert(dw.metadata_errors == 1);
+    g_ds4_shape = DS4_SHAPE_FLASH;
+    assert(!support_model_checkpoint_compatible(&m));
+    model_close(&m);
+    puts("V4.1 DSpark support layout and rejection gates: PASS");
+}
+
 int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[1], "--dspark")) {
+        check_dspark_layout(argv[2]);
+        return 0;
+    }
     if (argc == 2) {
         check_model_layout(argv[1]);
         return 0;
