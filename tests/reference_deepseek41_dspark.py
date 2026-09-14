@@ -86,10 +86,12 @@ def load_reference(path):
 class Weights:
     def __init__(self, source):
         self.db = SourceDB(str(source), index_validator=lambda _: None,
-            scale_validator=lambda t: validate_scales(t, True), tensor_filter=lambda n: n.startswith("mtp."))
+            scale_validator=lambda t: validate_scales(t, True),
+            tensor_filter=lambda n: n.startswith("mtp.") or n == "head.weight")
         self.q = NativeQuantizer(str(ROOT / "gguf-tools/libds4quants.dylib"))
         plan = build_plan(self.db, json.loads((source / "config.json").read_text()), "q4", True)
         self.types = {}
+        self.types["head.weight"] = 8
         for item in plan:
             if item.is_expert:
                 for expert in range(item.expert_count):
@@ -97,8 +99,8 @@ class Weights:
             else:
                 self.types[item.source] = item.qtype
 
-    def get(self, name):
-        source = self.q.to_f32(self.db, name)
+    def get(self, name, row_start=0, row_count=None):
+        source = self.q.to_f32(self.db, name, row_start, row_count)
         qt = self.types[name]
         encoded = self.q.encode(source, qt)
         if qt == 0:
@@ -108,6 +110,21 @@ class Weights:
         else:
             values = dequantize(np.frombuffer(encoded, np.uint8), GGMLQuantizationType(qt))
         return torch.from_numpy(values.reshape(source.shape).copy())
+
+
+class SharedHead(torch.nn.Module):
+    def __init__(self, weights, vocab):
+        super().__init__()
+        self.weights, self.vocab = weights, vocab
+
+    def forward(self, x, full_logits=False):
+        if not full_logits:
+            x = x[:, -1]
+        output = torch.empty(*x.shape[:-1], self.vocab, dtype=torch.float32)
+        for start in range(0, self.vocab, 2048):
+            count = min(2048, self.vocab - start)
+            output[..., start:start+count] = F.linear(x.float(), self.weights.get("head.weight", start, count))
+        return output
 
 
 def make_blocks(ref, args, weights):
@@ -168,6 +185,7 @@ def main():
     args = ref.ModelArgs(**config)
     weights = Weights(opts.hf)
     blocks = make_blocks(ref, args, weights)
+    blocks[-1].head = SharedHead(weights, args.vocab_size)
     all_reports = {}
     for folder in sorted(opts.dump.iterdir(), key=lambda p: int(p.name)):
         meta = json.loads((folder / "meta.json").read_text())
@@ -198,6 +216,8 @@ def main():
         collapsed = blocks[-1].hc_pre(x, pre)
         compare(folder, "2-collapsed", collapsed, reports)
         base = read(folder / "base_logits.f32", (1, 5, args.vocab_size))
+        reference_base = blocks[-1].head(blocks[-1].norm(collapsed), full_logits=True)
+        compare(folder, "base_logits", reference_base, reports)
         previous = torch.tensor([meta["seed"]])
         proposed, embeds = [], []
         for i in range(5):
@@ -209,6 +229,14 @@ def main():
         compare(folder, "confidence", confidence, reports)
         print(json.dumps(dict(position=pos, metal_proposals=meta["proposals"],
             reference_markov_on_metal_base=proposed)), flush=True)
+        previous = torch.tensor([meta["seed"]])
+        complete = []
+        for i in range(5):
+            bias, _ = blocks[-1].markov_head(previous)
+            previous = (reference_base[:, i] + bias).argmax(-1)
+            complete.append(previous.item())
+        print(json.dumps(dict(position=pos, reference_proposals=complete,
+            exact_proposals=complete == meta["proposals"])), flush=True)
         all_reports[folder.name] = reports
     opts.output.write_text(json.dumps(all_reports, indent=2) + "\n")
 
