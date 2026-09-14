@@ -39897,7 +39897,17 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
         !ds41_attention_select(g, m, l, il) ||
         !ds41_stage(il, pos, "attn_select")) return false;
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
-    if (n_comp && (!ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
+    /* Reuse layers retain their source layer's KV owner and selected indices.
+     * Scalar decode keeps this gathered buffer live until the next source. */
+    const bool reuse_gather =
+#if defined(__APPLE__)
+        !projected && g->tp_world == 1 && !g->streaming &&
+        !getenv("DS4_METAL_DISABLE_V41_REUSE_GATHER");
+#else
+        false;
+#endif
+    if (n_comp && (!reuse_gather || ds41_index_source(il)) &&
+        (!ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
                                           g->selected_comp, n_comp, attended) ||
                    !ds41_stage(il, pos, "attn_gather"))) return false;
     const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
