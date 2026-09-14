@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Convert DeepSeek V4.1 Flash to DwarfStar's Q2 or Q4_K GGUF.
+"""Convert DeepSeek V4.1 Flash to DwarfStar's Q2, Q4_K or native MXFP4 GGUF.
 
-Uses the project's C quantizers. Engram FP8 rows and their scales are packed
-losslessly at the end of the file, outside the main model's resident extent.
-Vision and DSpark are separate models and are not part of this text GGUF.
+Uses the project's C quantizers. The mxfp4 recipe never dequantizes an expert:
+the released FP4 codes and E8M0 scales are relaid into GGUF MXFP4 blocks byte
+for byte. Engram FP8 rows and their scales are packed losslessly at the end of
+the file, outside the main model's resident extent. Vision and DSpark are
+separate models and are not part of this text GGUF.
 """
 
 import argparse
@@ -21,15 +23,18 @@ import time
 from deepseek41_metadata import GGUF_ALIGNMENT, metadata, dspark_metadata
 from glm53_quantize import (
     SourceDB, TensorPlan, Quantizer, Imatrix, QTYPE_F32, QTYPE_F16,
-    QTYPE_Q8_0, QTYPE_Q2_K, QTYPE_Q4_K, QTYPE_IQ2_XXS, QTYPE_I8, align,
-    conversion_signature, kv_string, load_resume_state, print_plan,
+    QTYPE_Q8_0, QTYPE_Q2_K, QTYPE_Q4_K, QTYPE_IQ2_XXS, QTYPE_I8, QTYPE_MXFP4,
+    align, conversion_signature, kv_string, load_resume_state, print_plan,
     qtype_nbytes, save_resume_state, tensor_header,
 )
 
 QUANTIZATION = {
     "q2": "IQ2_XXS gate/up; Q2_K down; Q8_0 attention/shared/head",
     "q4": "Q4_K gate/up/down; Q8_0 attention/shared/head",
+    "mxfp4": "native FP4 gate/up/down preserved as MXFP4; Q8_0 attention/shared/head",
 }
+
+EXPERT_QTYPE = {"q4": QTYPE_Q4_K, "mxfp4": QTYPE_MXFP4}
 
 
 def scale_name(name):
@@ -139,7 +144,7 @@ def build_plan(db, config, quant="q2", support=False):
             for expert in range(experts):
                 claim(pattern.format(expert=expert), (shape[0], shape[1] // 2), "I8")
             plan.append(TensorPlan(f"{dst}.ffn_{part}_exps.weight", (*reversed(shape), experts),
-                                   QTYPE_Q4_K if quant == "q4" else qt,
+                                   EXPERT_QTYPE.get(quant, qt),
                                    "experts", source=pattern, expert_layer=layer,
                                    expert_part=part, expert_count=experts))
         if not support and layer in c["engram_layer_ids"]:
@@ -219,6 +224,44 @@ class NativeQuantizer(Quantizer):
             raise ValueError("F16 tensor would overflow; preserve this family in BF16/F32")
         return super().encode(array, qtype, imatrix)
 
+    def repack_mxfp4(self, db, name):
+        """Relay a released FP4 expert into GGUF MXFP4 blocks without touching a value.
+
+        The source packs consecutive E2M1 codes two per byte (low nibble first) with
+        one E8M0 scale per 32 codes along K. A GGUF block is that scale byte followed
+        by 16 bytes holding codes 0..15 in the low nibbles and 16..31 in the high."""
+        np = self.np
+        info = db.info(name)
+        if info["dtype"] != "I8":
+            raise ValueError(f"{name}: MXFP4 preservation needs packed I8 codes, got {info['dtype']}")
+        rows, packed = info["shape"]
+        if packed % 16:
+            raise ValueError(f"{name}: K is not a multiple of 32")
+        blocks = packed // 16
+        sinfo = db.info(scale_name(name))
+        if sinfo["dtype"] != "F8_E8M0" or sinfo["shape"] != [rows, blocks]:
+            raise ValueError(f"{name}: expected E8M0 scales {[rows, blocks]}, got {sinfo}")
+        codes = np.frombuffer(db.read(name), dtype=np.uint8).reshape(rows, blocks, 16)
+        scales = np.frombuffer(db.read(scale_name(name)), dtype=np.uint8).reshape(rows, blocks)
+        if np.any(scales == 255):
+            raise ValueError(f"{name}: nonfinite scale")
+        elements = np.empty((rows, blocks, 32), dtype=np.uint8)
+        elements[:, :, 0::2] = codes & 15
+        elements[:, :, 1::2] = codes >> 4
+        out = np.empty((rows, blocks, 17), dtype=np.uint8)
+        out[:, :, 0] = scales
+        out[:, :, 1:] = elements[:, :, :16] | (elements[:, :, 16:] << 4)
+        # Read the blocks back the way the kernels do before trusting the layout.
+        if (not np.array_equal(out[:, :, 1:] & 15, elements[:, :, :16]) or
+                not np.array_equal(out[:, :, 1:] >> 4, elements[:, :, 16:])):
+            raise ValueError(f"{name}: MXFP4 code repack mismatch")
+        return out.tobytes()
+
+    def encode_expert(self, db, name, qtype, imatrix=None):
+        if qtype == QTYPE_MXFP4:
+            return self.repack_mxfp4(db, name)
+        return self.encode(self.to_f32(db, name), qtype, imatrix)
+
 
 def write_engram(fp, item, db, np):
     # Keep weights and scales together without changing either byte. A chunk
@@ -293,9 +336,11 @@ def write_gguf(args, plan, records, db):
                 write_engram(fp, item, db, quantizer.np)
             elif item.is_expert:
                 def convert(expert):
-                    values = quantizer.to_f32(db, item.source.format(expert=expert))
+                    source = item.source.format(expert=expert)
+                    if item.qtype == QTYPE_MXFP4:
+                        return quantizer.repack_mxfp4(db, source), False
                     importance = imatrix.expert(item.name, expert, item.shape[0], item.expert_count)
-                    return quantizer.encode(values, item.qtype, importance), importance is None
+                    return quantizer.encode_expert(db, source, item.qtype, importance), importance is None
                 for start in range(0, item.expert_count, args.threads):
                     futures = [pool.submit(convert, e) for e in range(start, min(start + args.threads, item.expert_count))]
                     for future in futures:

@@ -38,9 +38,8 @@ def check_payload(fp, offset, item, db, quantizer, imatrix):
                     {0, (item.expert_layer * 17 + 41) % item.expert_count, item.expert_count - 1})
         stride = item.nbytes // item.expert_count
         for expert in sorted(selected):
-            values = quantizer.to_f32(db, item.source.format(expert=expert))
             importance = imatrix.expert(item.name, expert, item.shape[0], item.expert_count)
-            expected = quantizer.encode(values, item.qtype, importance)
+            expected = quantizer.encode_expert(db, item.source.format(expert=expert), item.qtype, importance)
             fp.seek(offset + expert * stride)
             if len(expected) != stride or read_exact(fp, stride, item.name) != expected:
                 raise ValueError(f"{item.name}: encoded expert {expert} differs from source recipe")
