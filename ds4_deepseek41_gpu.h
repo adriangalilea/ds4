@@ -158,12 +158,24 @@ int ds4_gpu_dsv41_shared_gate_up_swiglu(ds4_gpu_tensor *mid, const ds4_gpu_tenso
                                        const void *model_map, uint64_t model_size,
                                        uint64_t gate_offset, uint64_t up_offset,
                                        uint32_t n_embd, uint32_t n_ff, float clamp);
-int ds4_gpu_dsv41_shared_down_hc_expand4(ds4_gpu_tensor *out, ds4_gpu_tensor *shared,
-                                        ds4_gpu_tensor *block, const ds4_gpu_tensor *mid,
-                                        const ds4_gpu_tensor *routed, const ds4_gpu_tensor *residual,
-                                        const ds4_gpu_tensor *split, ds4_gpu_tensor *pre,
-                                        const void *model_map, uint64_t model_size,
-                                        uint64_t down_offset, uint32_t n_embd, uint32_t n_ff);
+/* Decode attention glue for one token row, byte-identical to the standalone
+ * sequences.  matvec_bf16: a Q8_0 or F16 single-row matvec whose store is
+ * the BF16 rounding (1 done, 0 not covered, -1 error).  qkv_norm_kv_tail:
+ * the q LoRA and KV weighted norms with their roundings, then the KV RoPE,
+ * FP8 (E8M0) block quantization and the copy into the raw window row at
+ * window_offset.  bf16_rope: the rounding pass over whole rows plus the
+ * (inverse) RoPE on their last 64 values. */
+enum { DS4_V41_WEIGHT_F16 = 1, DS4_V41_WEIGHT_Q8_0 = 8 };   /* GGUF tensor type ids */
+int ds4_gpu_dsv41_matvec_bf16(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                             uint64_t weight_offset, uint32_t type, uint32_t in_dim, uint32_t out_dim,
+                             const ds4_gpu_tensor *x);
+int ds4_gpu_dsv41_qkv_norm_kv_tail(ds4_gpu_tensor *q, ds4_gpu_tensor *kv, ds4_gpu_tensor *window,
+                                  uint64_t window_offset, const void *model_map, uint64_t model_size,
+                                  uint64_t q_weight_offset, uint64_t kv_weight_offset,
+                                  uint32_t q_n, uint32_t kv_n, float eps, uint32_t pos,
+                                  bool compressed);
+int ds4_gpu_dsv41_bf16_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
+                           uint32_t rows, uint32_t start, bool compressed, bool inverse);
 
 #ifdef __cplusplus
 }
