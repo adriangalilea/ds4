@@ -62,6 +62,41 @@ done:
     return rc;
 }
 
+typedef struct {
+    ds4_gpu_tensor *tensor[32];
+    char name[32][64];
+    uint64_t bytes[32];
+    unsigned count;
+} draft_trace;
+
+static bool capture_trace(void *ud, const char *name, uint32_t stage,
+                            const ds4_gpu_tensor *src, uint64_t bytes) {
+    draft_trace *t = ud;
+    if (t->count == 32) return false;
+    const unsigned i = t->count++;
+    snprintf(t->name[i], sizeof(t->name[i]), "%u-%s.f32", stage, name);
+    t->bytes[i] = bytes;
+    t->tensor[i] = ds4_gpu_tensor_alloc(bytes);
+    return t->tensor[i] && ds4_gpu_tensor_copy(t->tensor[i], 0, src, 0, bytes);
+}
+
+static bool write_tensor(const char *dir, const char *name, const ds4_gpu_tensor *tensor, uint64_t bytes) {
+    char path[4096];
+    if (snprintf(path, sizeof(path), "%s/%s", dir, name) >= (int)sizeof(path)) return false;
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return false;
+    void *data = malloc(bytes);
+    const bool ok = data && ds4_gpu_tensor_read(tensor, 0, data, bytes) &&
+        fwrite(data, 1, bytes, fp) == bytes;
+    free(data);
+    return fclose(fp) == 0 && ok;
+}
+
+static void free_trace(draft_trace *t) {
+    for (unsigned i = 0; i < t->count; i++) ds4_gpu_tensor_free(t->tensor[i]);
+    memset(t, 0, sizeof(*t));
+}
+
 static int check_live(const char *target_path, const char *support_path,
                         const char *prompt_path, bool capture) {
     int rc = 1;
@@ -70,6 +105,8 @@ static int check_live(const char *target_path, const char *support_path,
     ds4_model support = {.fd = -1};
     ds4_dspark_weights dw = {0};
     ds41_dspark_graph draft = {0};
+    draft_trace trace = {0};
+    const char *dump_root = getenv("DS4_DSPARK_DUMP_DIR");
     ds4_gpu_tensor *last = NULL;
     ds4_tokens tokens = {0};
     char *prompt = NULL, err[256] = {0};
@@ -115,10 +152,36 @@ static int check_live(const char *target_path, const char *support_path,
             const uint64_t bytes = (uint64_t)3 * DS4_N_EMBD * sizeof(float);
             last = ds4_gpu_tensor_view(c->hidden, (pos % 128u) * bytes, bytes);
             CHECK(last);
+            char dump_dir[4096] = {0};
+            const bool dump = dump_root && (i == 0 || i == 17 || i == 127);
+            if (dump) {
+                CHECK(snprintf(dump_dir, sizeof(dump_dir), "%s/%u", dump_root, i) < (int)sizeof(dump_dir));
+                CHECK(mkdir(dump_dir, 0755) == 0);
+                CHECK(ds41_dspark_capture_pack(draft.main_input, c, pos + 1u));
+                CHECK(write_tensor(dump_dir, "hidden.f32", draft.main_input, 128u * bytes));
+                draft.trace = capture_trace;
+                draft.trace_ud = &trace;
+            }
             const double t0 = now_sec();
             CHECK(ds41_dspark_forward(&draft, &engine->model, &engine->weights, &support,
                                         last, pos, token, proposals[i], confidence[i]));
             draft_ms += (now_sec() - t0) * 1000;
+            if (dump) {
+                draft.trace = NULL;
+                for (unsigned j = 0; j < trace.count; j++)
+                    CHECK(write_tensor(dump_dir, trace.name[j], trace.tensor[j], trace.bytes[j]));
+                CHECK(write_tensor(dump_dir, "base_logits.f32", draft.base_logits,
+                                    5u * DS4_N_VOCAB * sizeof(float)));
+                CHECK(write_tensor(dump_dir, "confidence.f32", draft.confidence, 5u * sizeof(float)));
+                char path[4096];
+                CHECK(snprintf(path, sizeof(path), "%s/meta.json", dump_dir) < (int)sizeof(path));
+                FILE *fp = fopen(path, "w");
+                CHECK(fp);
+                fprintf(fp, "{\"position\":%u,\"seed\":%d,\"proposals\":[%d,%d,%d,%d,%d]}\n",
+                    pos, token, proposals[i][0], proposals[i][1], proposals[i][2], proposals[i][3], proposals[i][4]);
+                CHECK(fclose(fp) == 0);
+                free_trace(&trace);
+            }
             ds4_gpu_tensor_free(last); last = NULL;
         }
         if (i + 1u < 256) {
@@ -162,6 +225,7 @@ done:
     if (rc) fprintf(stderr, "V4.1 live drafter error: %s\n", err);
     if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
     ds4_gpu_tensor_free(last);
+    free_trace(&trace);
     ds41_dspark_free(&draft);
     ds4_session_free(session);
     ds4_engine_close(engine);

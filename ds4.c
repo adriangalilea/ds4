@@ -40688,7 +40688,14 @@ typedef struct {
     ds4_gpu_tensor *window[3];
     uint32_t cache_end;
     bool seeded;
+    bool (*trace)(void *, const char *, uint32_t, const ds4_gpu_tensor *, uint64_t);
+    void *trace_ud;
 } ds41_dspark_graph;
+
+static bool ds41_dspark_trace(ds41_dspark_graph *d, const char *name, uint32_t stage,
+                              const ds4_gpu_tensor *tensor, uint64_t floats) {
+    return !d->trace || d->trace(d->trace_ud, name, stage, tensor, floats * sizeof(float));
+}
 
 static void ds41_dspark_free(ds41_dspark_graph *d) {
     if (!d) return;
@@ -40853,23 +40860,31 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_forward(ds41_dspark_graph *d,
             target_weights->token_embd->abs_offset, target_weights->token_embd->type,
             DS4_N_VOCAB, count, DS4_N_EMBD) &&
          ds4_gpu_repeat_hc_rows_tensor(b->residual, b->x, count, DS4_N_EMBD, DS4_N_HC));
+    if (ok) ok = ds41_dspark_trace(d, "main", 0, d->main_x, DS4_N_EMBD) &&
+        ds41_dspark_trace(d, "embedding", 0, b->residual, count * DS4_N_HC * DS4_N_EMBD);
     for (uint32_t stage = 0; ok && stage < dw->n_stages; stage++) {
         const ds4_layer_weights *l = &dw->stage[stage].block;
         ok = ds41_hc_before_attention_batch(b, m, l, stage == 0, count) &&
+            ds41_dspark_trace(d, "attn_input", stage, b->norm, count * DS4_N_EMBD) &&
             ds41_dspark_attention(d, m, stage, pos) &&
+            ds41_dspark_trace(d, "attn_output", stage, b->block, count * DS4_N_EMBD) &&
             ds41_after_attention_batch(b, m, l, count) &&
+            ds41_dspark_trace(d, "ffn_input", stage, b->norm, count * DS4_N_EMBD) &&
             ds41_moe_batch_experts(g, m, l, DS4_N_LAYER + stage, count, false,
                                     dw->n_expert, dw->n_expert_used) &&
+            ds41_dspark_trace(d, "route", stage, b->route_logits, count * dw->n_expert) &&
             ds4_gpu_add_tensor(b->block, b->routed, b->shared, count * DS4_N_EMBD) &&
             ds4_gpu_dsv41_quantize(b->block, DS4_N_EMBD, count, DS4_V41_BF16) &&
             ds4_gpu_hc_expand_split_tensor(b->residual, b->block, b->after_attn,
                                             b->ffn_split, DS4_N_EMBD, DS4_N_HC) &&
-            ds4_gpu_dsv41_quantize(b->residual, DS4_N_HC * DS4_N_EMBD, count, DS4_V41_BF16);
+            ds4_gpu_dsv41_quantize(b->residual, DS4_N_HC * DS4_N_EMBD, count, DS4_V41_BF16) &&
+            ds41_dspark_trace(d, "residual", stage, b->residual, count * DS4_N_HC * DS4_N_EMBD);
     }
     const ds4_dspark_stage_weights *final = &dw->stage[dw->n_stages - 1u];
     if (ok) ok = ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->residual, b->ffn_split,
                                                       DS4_N_EMBD, DS4_N_HC) &&
         ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, count, DS4_V41_BF16) &&
+        ds41_dspark_trace(d, "collapsed", dw->n_stages - 1u, b->x, count * DS4_N_EMBD) &&
         ds41_norm_batch(b->norm, b->x, m, final->norm, count) &&
         ds41_matmul_batch(d->base_logits, target, target_weights->output, b->norm, count, false);
     if (!ds4_gpu_end_commands()) ok = false;
