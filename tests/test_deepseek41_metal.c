@@ -316,6 +316,91 @@ static int check_hc_scaled(void) {
     return 1;
 }
 
+/* The fused decode HC glue (norm+mix, split+collapse+BF16+norm+BF16,
+ * expand+BF16) must be byte-identical to the standalone dispatch sequence
+ * the V4.1 graph ran before it, at V4.1's shape (4 x 5120, 24 mixes). */
+static int check_hc_fuse(void) {
+    enum { D = 5120, HC = 4, N = HC * D, OUT = 24, ITERS = 20 };
+    const float hc_eps = 1e-6f, rms_eps = 1e-20f;
+    const size_t fn_bytes = (size_t)N * OUT * sizeof(_Float16);
+    const size_t scale_off = fn_bytes, base_off = scale_off + 64, normw_off = base_off + 128;
+    const size_t page = (size_t)getpagesize();
+    const size_t mapped = (normw_off + D * sizeof(float) + page - 1) / page * page;
+    void *model = NULL;
+    CHECK(!posix_memalign(&model, page, mapped));
+    _Float16 *fn = model;
+    float *scale = (float *)((char *)model + scale_off);
+    float *base = (float *)((char *)model + base_off);
+    float *normw = (float *)((char *)model + normw_off);
+    for (size_t i = 0; i < (size_t)N * OUT; i++) fn[i] = (_Float16)(random_value() / 64);
+    for (int i = 0; i < 3; i++) scale[i] = 0.5f + random_value() / 8;
+    for (int i = 0; i < OUT; i++) base[i] = random_value() / 4;
+    for (int i = 0; i < D; i++) normw[i] = 1.0f + random_value() / 8;
+    CHECK(ds4_gpu_set_model_map(model, mapped));
+
+    ds4_gpu_tensor *residual = upload(NULL, N * 4), *block = upload(NULL, D * 4), *pre = upload(NULL, 16);
+    ds4_gpu_tensor *flat = upload(NULL, N * 4);
+    ds4_gpu_tensor *mix[2] = {upload(NULL, OUT * 4), upload(NULL, OUT * 4)};
+    ds4_gpu_tensor *split[2] = {upload(NULL, OUT * 4), upload(NULL, OUT * 4)};
+    ds4_gpu_tensor *x[2] = {upload(NULL, D * 4), upload(NULL, D * 4)};
+    ds4_gpu_tensor *norm[2] = {upload(NULL, D * 4), upload(NULL, D * 4)};
+    ds4_gpu_tensor *out[2] = {upload(NULL, N * 4), upload(NULL, N * 4)};
+    ds4_gpu_tensor *pre_next[2] = {upload(NULL, 16), upload(NULL, 16)};
+    CHECK(residual && block && pre && flat && mix[0] && mix[1] && split[0] && split[1] &&
+          x[0] && x[1] && norm[0] && norm[1] && out[0] && out[1] && pre_next[0] && pre_next[1]);
+    float *res = ds4_gpu_tensor_contents(residual), *blk = ds4_gpu_tensor_contents(block);
+    float *p = ds4_gpu_tensor_contents(pre);
+    double elapsed[2] = {0};
+    for (int round = 0; round < 6; round++) {
+        for (int i = 0; i < N; i++) res[i] = bf16(random_value() * (round == 5 ? 0x1p-14f : 1.0f));
+        for (int i = 0; i < D; i++) blk[i] = bf16(random_value());
+        for (int i = 0; i < HC; i++) p[i] = 0.5f + random_value() / 8 + hc_eps;
+        for (int mode = 0; mode < 2; mode++) {
+            const double begin = monotonic_seconds();
+            CHECK(ds4_gpu_begin_commands());
+            if (mode == 0) {
+                CHECK(ds4_gpu_rms_norm_plain_tensor(flat, residual, N, rms_eps));
+                CHECK(ds4_gpu_matmul_f16_tensor(mix[0], model, mapped, 0, N, OUT, flat, 1));
+                CHECK(ds4_gpu_hc_split_sinkhorn_tensor(split[0], mix[0], model, mapped,
+                    scale_off, base_off, HC, ITERS, hc_eps));
+                CHECK(ds4_gpu_hc_weighted_sum_tensor(x[0], residual, pre, D, HC));
+                CHECK(ds4_gpu_dsv41_quantize(x[0], D, 1, DS4_V41_BF16));
+                CHECK(ds4_gpu_rms_norm_weight_tensor(norm[0], x[0], model, mapped, normw_off, D, rms_eps));
+                CHECK(ds4_gpu_dsv41_quantize(norm[0], D, 1, DS4_V41_BF16));
+                CHECK(ds4_gpu_hc_expand_split_tensor(out[0], block, residual, split[0], D, HC));
+                CHECK(ds4_gpu_dsv41_quantize(out[0], N, 1, DS4_V41_BF16));
+                CHECK(ds4_gpu_tensor_copy(pre_next[0], 0, split[0], 0, 16));
+            } else {
+                CHECK(ds4_gpu_hc_rms_norm_mix_f16_tensor(mix[1], residual, model, mapped, 0, N, OUT, rms_eps));
+                CHECK(ds4_gpu_dsv41_hc_collapse_norm(split[1], x[1], norm[1], mix[1], pre, residual,
+                    model, mapped, scale_off, base_off, normw_off, D, HC, ITERS, hc_eps, rms_eps));
+                CHECK(ds4_gpu_dsv41_hc_expand4(out[1], block, residual, split[1], pre_next[1], D));
+            }
+            CHECK(ds4_gpu_end_commands());
+            CHECK(ds4_gpu_synchronize());
+            if (round) elapsed[mode] += (monotonic_seconds() - begin) * 1000.0 / 5;
+        }
+        CHECK(!memcmp(ds4_gpu_tensor_contents(mix[0]), ds4_gpu_tensor_contents(mix[1]), OUT * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(split[0]), ds4_gpu_tensor_contents(split[1]), OUT * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(x[0]), ds4_gpu_tensor_contents(x[1]), D * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(norm[0]), ds4_gpu_tensor_contents(norm[1]), D * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(out[0]), ds4_gpu_tensor_contents(out[1]), N * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(pre_next[0]), ds4_gpu_tensor_contents(pre_next[1]), 16));
+        const float *s = ds4_gpu_tensor_contents(split[1]);
+        for (int i = 0; i < OUT; i++) CHECK(isfinite(s[i]));
+    }
+    fprintf(stderr, "HC fuse: 10 dispatches %.3f ms -> 3 dispatches %.3f ms, outputs byte-identical\n",
+            elapsed[0], elapsed[1]);
+    for (int i = 0; i < 2; i++) {
+        ds4_gpu_tensor_free(mix[i]); ds4_gpu_tensor_free(split[i]); ds4_gpu_tensor_free(x[i]);
+        ds4_gpu_tensor_free(norm[i]); ds4_gpu_tensor_free(out[i]); ds4_gpu_tensor_free(pre_next[i]);
+    }
+    ds4_gpu_tensor_free(residual); ds4_gpu_tensor_free(block); ds4_gpu_tensor_free(pre); ds4_gpu_tensor_free(flat);
+    ds4_gpu_cleanup(); free(model);
+    CHECK(ds4_gpu_init());
+    return 1;
+}
+
 #endif
 
 static int check_engram(void) {
@@ -1279,6 +1364,11 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--hc-fuse")) {
+        const int ok = ds4_gpu_init() && check_hc_fuse();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
 #endif
     if (argc == 2 && !strcmp(argv[1], "--bf16-linear")) {
         const int ok = ds4_gpu_init() && check_bf16_linear();
@@ -1315,6 +1405,9 @@ int main(int argc, char **argv) {
              check_candidates() && check_sparse_gather() && check_indexer_batch() &&
              check_embedding() && check_index_projection() && check_general_topk() && check_causal_topk() && check_compact_carry() && check_attention_output(false) &&
              check_tp_attention();
+#ifdef __APPLE__
+    ok = ok && check_hc_fuse();
+#endif
     ds4_gpu_cleanup();
     return ok ? 0 : 1;
 }

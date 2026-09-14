@@ -39917,6 +39917,41 @@ static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
                                      (uint64_t)DS4_N_VOCAB * sizeof(float));
 }
 
+#if defined(__APPLE__)
+/* DeepSeek's production decode runs each half-layer's hyper-connection work
+ * in one kernel ("Mega-mHC", tech report 3.2).  ds4's V4.1 graph mirrored the
+ * reference op by op: 19 HC glue dispatches per layer (norm, mix matvec,
+ * split, collapse, BF16, weighted norm, BF16, expand, BF16, ...).  The fused
+ * path keeps every reduction tree and rounding point of that sequence
+ * (tests/test_deepseek41_metal --hc-fuse) and issues 6.  Single box only; the
+ * TP graph keeps the unfused sequence. */
+static bool ds41_hc_fused(const ds41_gpu_graph *g) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("DS4_METAL_DISABLE_V41_HC_FUSE") == NULL &&
+            ds4_gpu_hc_rms_norm_mix_f16_available() != 0;
+    }
+    return enabled && g->tp_world == 1;
+}
+
+/* Plain RMSNorm over the flattened HC row and the F16 mix matvec, one dispatch. */
+static bool ds41_hc_mix_fused(ds41_gpu_graph *g, const ds4_model *m,
+                              const ds4_tensor *fn, const ds4_gpu_tensor *residual) {
+    return ds4_gpu_hc_rms_norm_mix_f16_tensor(g->mix, residual, m->map, m->size, fn->abs_offset,
+        DS4_N_HC * DS4_N_EMBD, (uint32_t)fn->dim[1], DS4_RMS_EPS) != 0;
+}
+
+static bool ds41_hc_collapse_norm_fused(ds41_gpu_graph *g, const ds4_model *m,
+                                        const ds4_layer_weights *l, bool ffn) {
+    return ds4_gpu_dsv41_hc_collapse_norm(ffn ? g->ffn_split : g->attn_split, g->x, g->norm, g->mix,
+        ffn ? g->attn_split : g->pre, ffn ? g->after_attn : g->residual, m->map, m->size,
+        (ffn ? l->hc_ffn_scale : l->hc_attn_scale)->abs_offset,
+        (ffn ? l->hc_ffn_base : l->hc_attn_base)->abs_offset,
+        (ffn ? l->ffn_norm : l->attn_norm)->abs_offset,
+        DS4_N_EMBD, DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS, DS4_RMS_EPS) != 0;
+}
+#endif
+
 static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
                                        const ds4_layer_weights *l, uint32_t il) {
     if (ds41_engram_layer(il) && !ds41_image_at(g, g->pos)) {
@@ -39926,6 +39961,11 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
                 g->engram_q_norm[i], g->engram_k_norm[i], NULL, DS4_N_EMBD, 1, DS4_RMS_EPS))
             return false;
     }
+#if defined(__APPLE__)
+    if (ds41_hc_fused(g))
+        return ds41_hc_mix_fused(g, m, l->hc_attn_fn, g->residual) &&
+            ds41_hc_collapse_norm_fused(g, m, l, false);
+#endif
     return ds41_hc_mix(g, m, l, false) &&
         ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
         ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, l->attn_norm);
@@ -39933,6 +39973,12 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
                                       const ds4_layer_weights *l) {
+#if defined(__APPLE__)
+    if (ds41_hc_fused(g))
+        return ds4_gpu_dsv41_hc_expand4(g->after_attn, g->block, g->residual, g->attn_split, NULL, DS4_N_EMBD) &&
+            ds41_hc_mix_fused(g, m, l->hc_ffn_fn, g->after_attn) &&
+            ds41_hc_collapse_norm_fused(g, m, l, true);
+#endif
     return ds4_gpu_hc_expand_split_tensor(g->after_attn, g->block, g->residual, g->attn_split, DS4_N_EMBD, DS4_N_HC) &&
         ds41_bf16(g->after_attn, DS4_N_EMBD * DS4_N_HC) &&
         ds41_hc_mix(g, m, l, true) &&
@@ -40217,6 +40263,10 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
+#if defined(__APPLE__)
+    if (ds41_hc_fused(g))
+        return ds4_gpu_dsv41_hc_expand4(g->residual, g->block, g->after_attn, g->ffn_split, g->pre, DS4_N_EMBD);
+#endif
     return ds4_gpu_hc_expand_split_tensor(g->residual, g->block, g->after_attn, g->ffn_split, DS4_N_EMBD, DS4_N_HC) &&
         ds41_bf16(g->residual, DS4_N_EMBD * DS4_N_HC) &&
         ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float));

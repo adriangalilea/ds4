@@ -123,6 +123,24 @@ int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out,
 int ds4_gpu_dsv41_gather_kv(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
                            const ds4_gpu_tensor *ids, uint32_t source_rows,
                            uint32_t selected_rows);
+/* Decode HC glue for one token row, HC=4, byte-identical to the standalone
+ * split/collapse/BF16/norm/BF16 and expand/BF16 dispatch sequences.
+ * collapse_norm: split(mix) -> split; x = bf16(pre-weighted collapse of
+ * residual); norm = bf16(rmsnorm(x) * weight). `pre` is the coefficient row
+ * of the PREVIOUS sublayer's split (the first four floats of that tensor).
+ * expand4: out = bf16(post/comb expand of block into residual); when `pre`
+ * is given, split[0..3] is also copied into it. */
+int ds4_gpu_dsv41_hc_collapse_norm(ds4_gpu_tensor *split, ds4_gpu_tensor *x, ds4_gpu_tensor *norm,
+                                  const ds4_gpu_tensor *mix, const ds4_gpu_tensor *pre,
+                                  const ds4_gpu_tensor *residual,
+                                  const void *model_map, uint64_t model_size,
+                                  uint64_t scale_offset, uint64_t base_offset,
+                                  uint64_t norm_weight_offset,
+                                  uint32_t n_embd, uint32_t n_hc, uint32_t sinkhorn_iters,
+                                  float hc_eps, float norm_eps);
+int ds4_gpu_dsv41_hc_expand4(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
+                            const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split,
+                            ds4_gpu_tensor *pre, uint32_t n_embd);
 
 #ifdef __cplusplus
 }
