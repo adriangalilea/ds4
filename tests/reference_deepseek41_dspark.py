@@ -85,7 +85,8 @@ def load_reference(path):
 
 
 class Weights:
-    def __init__(self, source):
+    def __init__(self, source, native=False):
+        self.native = native
         self.db = SourceDB(str(source), index_validator=lambda _: None,
             scale_validator=lambda t: validate_scales(t, True),
             tensor_filter=lambda n: n.startswith("mtp.") or n == "head.weight")
@@ -102,6 +103,8 @@ class Weights:
 
     def get(self, name, row_start=0, row_count=None):
         source = self.q.to_f32(self.db, name, row_start, row_count)
+        if self.native and name != "head.weight":
+            return torch.from_numpy(source.copy())
         qt = self.types[name]
         encoded = self.q.encode(source, qt)
         if name == "head.weight":
@@ -144,10 +147,16 @@ def make_blocks(ref, args, weights):
             setattr(block.get_submodule(parent), leaf,
                 torch.nn.Parameter(weights.get(f"mtp.{stage}.{name}"), requires_grad=False))
         for name, module in block.named_modules():
-            if isinstance(module, ref.Linear) and ".experts." in name:
+            if isinstance(module, ref.Linear) and (weights.native or ".experts." in name):
                 source = f"mtp.{stage}.{name}.weight"
-                def forward(x, source=source):
-                    return F.linear(x.float(), weights.get(source)).to(x.dtype)
+                lazy = ".experts." in name
+                quantized = weights.native and weights.db.info(source)["dtype"] in ("I8", "F8_E4M3")
+                def forward(x, source=source, module=module, lazy=lazy, quantized=quantized):
+                    weight = weights.get(source) if lazy else module.weight
+                    if quantized:
+                        x = x.clone()
+                        act_quant(x, 32, "ue8m0", inplace=True)
+                    return F.linear(x.float(), weight).to(x.dtype)
                 module.forward = forward
         attn = block.attn
         attn.window_kv_cache = torch.zeros(1, 128, args.head_dim, dtype=torch.bfloat16)
@@ -182,6 +191,8 @@ def main():
     parser.add_argument("--dump", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--head-sha256", help="expected hash of the target GGUF Q8 head payload")
+    parser.add_argument("--native-drafter", action="store_true",
+        help="use released drafter weights and FP8 activation rounding; keep the measured target Q8 head")
     opts = parser.parse_args()
     torch.set_num_threads(8)
     torch.set_default_dtype(torch.bfloat16)
@@ -189,7 +200,7 @@ def main():
     config = json.loads((opts.reference / "inference/config.json").read_text())
     config.update(max_batch_size=1, max_seq_len=4096, dtype="bf16", expert_dtype=None, temperature=0)
     args = ref.ModelArgs(**config)
-    weights = Weights(opts.hf)
+    weights = Weights(opts.hf, opts.native_drafter)
     blocks = make_blocks(ref, args, weights)
     blocks[-1].head = SharedHead(weights, args.vocab_size)
     all_reports = {}
