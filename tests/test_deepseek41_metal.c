@@ -493,11 +493,16 @@ static int check_moe_fuse(void) {
         }
         const int32_t *sel = ds4_gpu_tensor_contents(selected[1]);
         for (int i = 0; i < K; i++) CHECK(sel[i] >= 0 && sel[i] < E);
+        /* Ties: the fused select orders equal scores by ascending index (the
+         * canonical argsort order); an argsort without that tie-break agrees
+         * on the set but not necessarily on the order. */
         if (ties) for (int i = 0; i < K; i++) CHECK(sel[i] == 4 + 5 * i);
         CHECK(!memcmp(ds4_gpu_tensor_contents(logits[0]), ds4_gpu_tensor_contents(logits[1]), E * 4));
         CHECK(!memcmp(ds4_gpu_tensor_contents(probs[0]), ds4_gpu_tensor_contents(probs[1]), E * 4));
-        CHECK(!memcmp(ds4_gpu_tensor_contents(selected[0]), sel, K * 4));
-        CHECK(!memcmp(ds4_gpu_tensor_contents(weights[0]), ds4_gpu_tensor_contents(weights[1]), K * 4));
+        if (!ties) {
+            CHECK(!memcmp(ds4_gpu_tensor_contents(selected[0]), sel, K * 4));
+            CHECK(!memcmp(ds4_gpu_tensor_contents(weights[0]), ds4_gpu_tensor_contents(weights[1]), K * 4));
+        }
         CHECK(!memcmp(ds4_gpu_tensor_contents(mid[0]), ds4_gpu_tensor_contents(mid[1]), FF * 4));
         CHECK(!memcmp(ds4_gpu_tensor_contents(shared[0]), ds4_gpu_tensor_contents(shared[1]), D * 4));
         CHECK(!memcmp(ds4_gpu_tensor_contents(block[0]), ds4_gpu_tensor_contents(block[1]), D * 4));
