@@ -39839,11 +39839,25 @@ static bool ds41_hc_fused(const ds41_gpu_graph *g) {
     return enabled && g->tp_world == 1;
 }
 
+/* Router matvec + select as one (two on pre-M5) dispatch. */
+static bool ds41_router_fused(const ds41_gpu_graph *g, const ds4_layer_weights *l) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("DS4_METAL_DISABLE_V41_MOE_FUSE") == NULL &&
+            getenv("DS4_METAL_DISABLE_V41_ROUTER_FUSE") == NULL;
+    }
+    return enabled && ds41_hc_fused(g) && l->ffn_gate_inp->type == DS4_TENSOR_F32;
+}
+
+/* Shared expert gate/up/SwiGLU as one dispatch and its down projection
+ * folded into the FFN tail (ds41_moe_finish / ds41_graph_after_moe agree). */
 static bool ds41_moe_fused(const ds41_gpu_graph *g, const ds4_layer_weights *l) {
     static int enabled = -1;
-    if (enabled < 0) enabled = getenv("DS4_METAL_DISABLE_V41_MOE_FUSE") == NULL;
+    if (enabled < 0) {
+        enabled = getenv("DS4_METAL_DISABLE_V41_MOE_FUSE") == NULL &&
+            getenv("DS4_METAL_DISABLE_V41_SHARED_FUSE") == NULL;
+    }
     return enabled && ds41_hc_fused(g) &&
-        l->ffn_gate_inp->type == DS4_TENSOR_F32 &&
         l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&
         l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
         l->ffn_down_shexp->type == DS4_TENSOR_Q8_0;
@@ -39862,7 +39876,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     if (!bias) return false;
 #if defined(__APPLE__)
     const bool fused = ds41_moe_fused(g, l);
-    if (fused) {
+    if (ds41_router_fused(g, l)) {
         if (!ds4_gpu_dsv41_router_select(g->selected, g->route_weights, g->route_probs,
                 g->route_logits, g->norm, m->map, m->size, l->ffn_gate_inp->abs_offset,
                 bias->abs_offset, true, DS4_N_EMBD, DS4_N_EXPERT, DS4_N_EXPERT_USED,
