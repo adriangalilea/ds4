@@ -285,7 +285,80 @@ done:
     return rc;
 }
 
+static int replay_taps(char **argv) {
+    int rc = 1;
+    ds4_model target = {.fd = -1}, support = {.fd = -1};
+    ds4_weights weights = {0};
+    ds41_dspark_graph draft = {0};
+    ds4_gpu_tensor *hidden = NULL, *last = NULL;
+    float *features = NULL;
+    FILE *fp = NULL;
+    int32_t seeds[256];
+    const uint32_t start = (uint32_t)strtoul(argv[6], NULL, 10);
+    const size_t row_bytes = 3u * 5120u * sizeof(float);
+    const size_t feature_bytes = 383u * row_bytes;
+    CHECK(!strcmp(argv[7], "real") || !strcmp(argv[7], "zero") || !strcmp(argv[7], "constant"));
+    g_ds4_shape = DS4_SHAPE_FLASH41;
+    model_open(&target, argv[2], true, false);
+    weights.token_embd = model_find_tensor(&target, "token_embd.weight");
+    weights.output = model_find_tensor(&target, "output.weight");
+    CHECK(weights.token_embd && weights.output && target.n_tensors == 2);
+    CHECK(weights.token_embd->type == DS4_TENSOR_F16 && weights.output->type == DS4_TENSOR_Q8_0);
+    model_open(&support, argv[3], true, false);
+    CHECK(support_model_checkpoint_compatible(&support));
+    const ds4_dspark_summary summary = model_dspark_summary(&support);
+    ds4_dspark_weights dw;
+    dspark_weights_bind_optional(&dw, &support, &summary);
+    CHECK(dw.v41 && !dw.missing_tensors && !dw.invalid_tensors && !dw.metadata_errors);
+    CHECK(dw.sliding_window == 128 && dw.block_size == 5 && dw.target_layer_count == 3);
+    features = malloc(feature_bytes);
+    CHECK(features);
+    fp = fopen(argv[4], "rb");
+    CHECK(fp && fread(features, 1, feature_bytes, fp) == feature_bytes && fgetc(fp) == EOF);
+    fclose(fp); fp = NULL;
+    fp = fopen(argv[5], "rb");
+    CHECK(fp && fread(seeds, 1, sizeof(seeds), fp) == sizeof(seeds) && fgetc(fp) == EOF);
+    fclose(fp); fp = NULL;
+    if (strcmp(argv[7], "real"))
+        for (size_t i = 0; i < feature_bytes / sizeof(float); i++)
+            features[i] = !strcmp(argv[7], "zero") ? 0.0f : 1.0f;
+    ds4_gpu_model_residency_skip(1);
+    CHECK(ds4_gpu_init());
+    CHECK(ds4_gpu_set_model_map_range(target.map, target.size, target.tensor_data_pos,
+        target.size - target.tensor_data_pos, target.max_tensor_bytes));
+    CHECK(ds4_gpu_set_model_map_range(support.map, support.size, support.tensor_data_pos,
+        support.size - support.tensor_data_pos, support.max_tensor_bytes));
+    CHECK(ds41_dspark_alloc(&draft, &dw));
+    hidden = ds4_gpu_tensor_alloc(feature_bytes);
+    CHECK(hidden && ds4_gpu_tensor_write(hidden, 0, features, feature_bytes));
+    CHECK(ds41_dspark_seed(&draft, &support, hidden, start, 128));
+    for (uint32_t i = 0; i < 256; i++) {
+        int32_t proposals[16] = {0};
+        float confidence[16] = {0};
+        last = ds4_gpu_tensor_view(hidden, (127u + i) * row_bytes, row_bytes);
+        CHECK(last && ds41_dspark_forward(&draft, &target, &weights, &support,
+            last, start + 127u + i, seeds[i], proposals, confidence));
+        printf("{\"i\":%u,\"seed\":%d,\"proposals\":[%d,%d,%d,%d,%d],\"confidence\":[%.9g,%.9g,%.9g,%.9g,%.9g]}\n",
+            i, seeds[i], proposals[0], proposals[1], proposals[2], proposals[3], proposals[4],
+            confidence[0], confidence[1], confidence[2], confidence[3], confidence[4]);
+        ds4_gpu_tensor_free(last); last = NULL;
+    }
+    rc = 0;
+done:
+    if (fp) fclose(fp);
+    if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
+    ds4_gpu_tensor_free(last);
+    ds4_gpu_tensor_free(hidden);
+    ds41_dspark_free(&draft);
+    ds4_gpu_cleanup();
+    model_close(&support);
+    model_close(&target);
+    free(features);
+    return rc;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 8 && !strcmp(argv[1], "--replay")) return replay_taps(argv);
     if (argc == 2 && !strcmp(argv[1], "--capture")) return check_capture();
     if (argc == 6 && !strcmp(argv[1], "--live") &&
         (!strcmp(argv[5], "draft") || !strcmp(argv[5], "baseline")))
