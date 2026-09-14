@@ -39485,6 +39485,13 @@ fail:
 #undef DS41_SCRATCH
 
 static bool ds41_bf16(ds4_gpu_tensor *x, uint32_t width) {
+    /* DS4_METAL_V41_SKIP_BF16 is a MEASUREMENT knob only: it drops the
+     * standalone BF16 rounding dispatches (nine per layer) to bound what
+     * folding them into their producers would save.  Output is NOT the
+     * released graph's while it is set. */
+    static int skip = -1;
+    if (skip < 0) skip = getenv("DS4_METAL_V41_SKIP_BF16") != NULL;
+    if (skip) return true;
     return ds4_gpu_dsv41_quantize(x, width, 1, DS4_V41_BF16) != 0;
 }
 
