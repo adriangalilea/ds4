@@ -446,6 +446,8 @@ static id<MTLComputePipelineState> g_moe_mul_mv_group_q4_k_pair_swiglu_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_group_q4_k_sum6_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_group6_q4_k_pair_swiglu_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_group6_q4_k_sum6_pipeline;
+static id<MTLComputePipelineState> g_moe_mul_mv_group6_q4_k_pair_swiglu_r1_pipeline;
+static id<MTLComputePipelineState> g_moe_mul_mv_group6_q4_k_sum6_r1_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_group8_q4_k_pair_swiglu_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_group8_q4_k_sum6_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_group24_q4_k_id_pipeline;
@@ -8056,6 +8058,31 @@ int ds4_gpu_init(void) {
         }
 
         error = nil;
+        fn = [library newFunctionWithName:@"kernel_mul_mv_group6_q4_K_pair_swiglu_f32_r1"
+                           constantValues:moe_mv_id_constants error:&error];
+        if (fn) g_moe_mul_mv_group6_q4_k_pair_swiglu_r1_pipeline =
+            [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_moe_mul_mv_group6_q4_k_pair_swiglu_r1_pipeline) {
+            fprintf(stderr, "ds4: Metal group6 Q4_K single-row gate/up pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        error = nil;
+        fn = [library newFunctionWithName:@"kernel_mul_mv_group6_q4_K_sum6_f32_r1"
+                           constantValues:moe_mv_id_constants error:&error];
+        if (fn) g_moe_mul_mv_group6_q4_k_sum6_r1_pipeline =
+            [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_moe_mul_mv_group6_q4_k_sum6_r1_pipeline) {
+            fprintf(stderr, "ds4: Metal group6 Q4_K single-row down pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        error = nil;
         fn = [library newFunctionWithName:@"kernel_mul_mv_group8_q4_K_pair_swiglu_f32"
                            constantValues:moe_mv_id_constants
                                     error:&error];
@@ -11592,6 +11619,8 @@ void ds4_gpu_cleanup(void) {
         g_moe_mul_mv_group_q4_k_sum6_pipeline = nil;
         g_moe_mul_mv_group6_q4_k_pair_swiglu_pipeline = nil;
         g_moe_mul_mv_group6_q4_k_sum6_pipeline = nil;
+        g_moe_mul_mv_group6_q4_k_pair_swiglu_r1_pipeline = nil;
+        g_moe_mul_mv_group6_q4_k_sum6_r1_pipeline = nil;
         g_moe_mul_mv_group8_q4_k_pair_swiglu_pipeline = nil;
         g_moe_mul_mv_group8_q4_k_sum6_pipeline = nil;
         g_moe_mul_mv_group24_q4_k_id_pipeline = nil;
@@ -40675,6 +40704,11 @@ int ds4_gpu_routed_moe_one_tensor(
             (getenv("DS4_METAL_ENABLE_Q4_GROUP6_EXPERT_TABLE") != NULL ||
              (expert_in_dim == 5120u && expert_mid_dim == 2304u)) &&
             getenv("DS4_METAL_DISABLE_Q4_GROUP6_EXPERT_TABLE") == NULL;
+        /* One row per SIMD group improves occupancy for V4.1's resident
+         * expert shape without changing the dot-product reduction tree. */
+        const bool q4_group6_single_row = use_q4_group6_experts &&
+            expert_in_dim == 5120u && expert_mid_dim == 2304u &&
+            getenv("DS4_METAL_DISABLE_V41_Q4_SINGLE_ROW") == NULL;
         const uint32_t q4_group8_expert_group_size = 48;
         const bool use_q4_group8_experts =
             !g_ssd_streaming_mode &&
@@ -42064,9 +42098,13 @@ int ds4_gpu_routed_moe_one_tensor(
                 .write_clamped = 0,
                 .clamp_value = clamp,
             };
+            ds4_gpu_mul_mv_id_args group6_args = gate_args;
+            if (q4_group6_single_row) group6_args.nr0 = 1;
             ok = ds4_gpu_encode_mul_mv_group6_pair_swiglu(cb,
+                                                            q4_group6_single_row ?
+                                                            g_moe_mul_mv_group6_q4_k_pair_swiglu_r1_pipeline :
                                                             g_moe_mul_mv_group6_q4_k_pair_swiglu_pipeline,
-                                                            &gate_args,
+                                                            &group6_args,
                                                             &act_args,
                                                             gate_group6_bufs,
                                                             gate_group6_offsets,
@@ -42685,9 +42723,13 @@ int ds4_gpu_routed_moe_one_tensor(
                                                     2,
                                                     q4_table_queue_residency);
         } else if (ok && use_q4_group6_experts) {
+            ds4_gpu_mul_mv_id_args group6_args = down_args;
+            if (q4_group6_single_row) group6_args.nr0 = 1;
             ok = ds4_gpu_encode_mul_mv_group6_sum6(cb,
+                                                    q4_group6_single_row ?
+                                                    g_moe_mul_mv_group6_q4_k_sum6_r1_pipeline :
                                                     g_moe_mul_mv_group6_q4_k_sum6_pipeline,
-                                                    &down_args,
+                                                    &group6_args,
                                                     down_group6_bufs,
                                                     down_group6_offsets,
                                                     midbuf,
