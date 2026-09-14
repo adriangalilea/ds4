@@ -21,7 +21,7 @@ def check(hf_dir, headers):
     validate_scales(tensors, support=True)
     plan = build_plan(db, config, "q4", support=True)
     outputs = {item.name: item for item in plan}
-    assert len(outputs) == len(plan) == 84
+    assert len(outputs) == len(plan) == 81  # 25 per block, six shared projections/heads
     assert all(item.name.startswith("mtp.") for item in plan)
     assert sum(item.is_expert for item in plan) == 9
     for item in plan:
