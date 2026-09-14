@@ -48063,8 +48063,17 @@ int ds4_gpu_dsv41_router_select(ds4_gpu_tensor *selected, ds4_gpu_tensor *weight
             [g_dsv4_completion_cache setObject:completion forKey:completion_key];
         }
         [g_transient_buffers addObject:completion];
-        const struct { uint32_t n_embd, n_expert, n_used, has_bias; float scale; } args =
-            {n_embd, n_expert, n_used, has_bias, scale};
+        /* One dispatch (last-arriving threadgroup selects) on M5 only, like
+         * V4's fused router: on the M3 Ultra the other groups' logits were
+         * not reliably visible to the last one.  Elsewhere the standalone
+         * F32 matvec runs first and one threadgroup selects. */
+        const bool fused_matvec = ds4_gpu_device_is_m5_apple_silicon() &&
+            getenv("DS4_METAL_DISABLE_V41_ROUTER_SINGLE_DISPATCH") == NULL;
+        if (!fused_matvec &&
+            !ds4_gpu_matmul_f32_tensor(logits, model_map, model_size, weight_offset,
+                                       n_embd, n_expert, x, 1)) return 0;
+        const struct { uint32_t n_embd, n_expert, n_used, has_bias; float scale; uint32_t fused_matvec; } args =
+            {n_embd, n_expert, n_used, has_bias, scale, fused_matvec};
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
@@ -48080,7 +48089,7 @@ int ds4_gpu_dsv41_router_select(ds4_gpu_tensor *selected, ds4_gpu_tensor *weight
         [enc setBuffer:ds4_gpu_tensor_buffer(weights) offset:ds4_gpu_tensor_offset(weights) atIndex:7];
         [enc setBuffer:completion offset:0 atIndex:8];
         [enc setThreadgroupMemoryLength:(512u + 32u) * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((n_expert + 1u) / 2u, 1, 1)
+        [enc dispatchThreadgroups:MTLSizeMake(fused_matvec ? (n_expert + 1u) / 2u : 1u, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 router select");
