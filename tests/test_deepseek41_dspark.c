@@ -84,6 +84,7 @@ static int check_live(const char *target_path, const char *support_path,
     double target_ms = 0, draft_ms = 0;
     for (uint32_t i = 0; i < 256; i++) {
         const int token = sample_argmax(session->logits, DS4_N_VOCAB);
+        CHECK(!vocab_token_is_generation_stop(&engine->vocab, token));
         generated[i] = token;
         size_t len = 0;
         char *piece = ds4_token_text(engine, token, &len);
