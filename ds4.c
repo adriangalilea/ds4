@@ -39285,6 +39285,9 @@ typedef struct {
     const ds4_dspark_weights *weights;
     ds4_gpu_tensor *hidden, *mean;
     uint32_t seen[3][128];
+    bool (*observe)(void *, uint32_t, uint32_t, uint32_t,
+                    const ds4_gpu_tensor *, uint64_t, uint64_t);
+    void *observe_ud;
 } ds41_dspark_capture;
 
 typedef struct {
@@ -39358,11 +39361,25 @@ static bool ds41_dspark_capture_rows(ds41_dspark_capture *c, uint32_t layer,
         ds4_gpu_tensor *out = ds4_gpu_tensor_view(c->hidden, ((uint64_t)slot * 3u + tap) * bytes, bytes);
         const bool ok = input && out &&
             ds4_gpu_hc_weighted_sum_tensor(out, input, c->mean, DS4_N_EMBD, DS4_N_HC) &&
-            ds4_gpu_dsv41_quantize(out, DS4_N_EMBD, 1, DS4_V41_BF16);
+            ds4_gpu_dsv41_quantize(out, DS4_N_EMBD, 1, DS4_V41_BF16) &&
+            (!c->observe ||
+             (c->observe(c->observe_ud, layer, start + i, 0, input, 0, 4u * bytes) &&
+              c->observe(c->observe_ud, layer, start + i, 1, out, 0, bytes)));
         ds4_gpu_tensor_free(input); ds4_gpu_tensor_free(out);
         if (!ok) return false;
         c->seen[tap][slot] = start + i;
     }
+    return true;
+}
+
+static bool ds41_dspark_observe_inputs(ds41_dspark_capture *c, uint32_t layer,
+                    const ds4_gpu_tensor *collapsed, const ds4_gpu_tensor *norm,
+                    uint32_t start, uint32_t count) {
+    if (!c || !c->observe) return true;
+    const uint64_t bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    for (uint32_t i = 0; i < count; i++)
+        if (!c->observe(c->observe_ud, layer, start + i, 2, collapsed, i * bytes, bytes) ||
+            !c->observe(c->observe_ud, layer, start + i, 3, norm, i * bytes, bytes)) return false;
     return true;
 }
 
@@ -40212,14 +40229,17 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
             return false;
     }
     if (!ds41_dspark_capture_rows(g->dspark_capture, il, g->residual, g->pos, 1)) return false;
+    bool ok;
 #if defined(__APPLE__)
     if (ds41_hc_fused(g))
-        return ds41_hc_mix_fused(g, m, l->hc_attn_fn, g->residual) &&
+        ok = ds41_hc_mix_fused(g, m, l->hc_attn_fn, g->residual) &&
             ds41_hc_collapse_norm_fused(g, m, l, false);
+    else
 #endif
-    return ds41_hc_mix(g, m, l, false) &&
+    ok = ds41_hc_mix(g, m, l, false) &&
         ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
         ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, l->attn_norm);
+    return ok && ds41_dspark_observe_inputs(g->dspark_capture, il, g->x, g->norm, g->pos, 1);
 }
 
 static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
@@ -41230,7 +41250,8 @@ static bool ds41_decoder_prepare(ds41_gpu_graph *g, const ds4_model *m,
                                                 DS4_N_EMBD, DS4_N_HC) :
             ds4_gpu_hc_weighted_sum_tensor(active.x, active.residual, active.pre, DS4_N_EMBD, DS4_N_HC);
         if (ok && batch_attention) ok = ds4_gpu_dsv41_quantize(active.x, DS4_N_EMBD, count, DS4_V41_BF16) &&
-            ds41_norm_batch(active.norm, active.x, m, l->attn_norm, count);
+            ds41_norm_batch(active.norm, active.x, m, l->attn_norm, count) &&
+            ds41_dspark_observe_inputs(g->dspark_capture, il, active.x, active.norm, initial_start + off, count);
         if (ok && batch_publish)
             ok = ds41_attention_publish_batch(g, &active, m, l, il, initial_start + off, count);
         if (ok && !publish && batch_attention)
@@ -41515,7 +41536,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             }
             if (ok && batch_hc)
                 ok = ds41_before_attention_batch(g, &active, m, &w->layer[il], il, count) &&
-                    ds41_dspark_capture_rows(g->dspark_capture, il, active.residual, start, count);
+                    ds41_dspark_capture_rows(g->dspark_capture, il, active.residual, start, count) &&
+                    ds41_dspark_observe_inputs(g->dspark_capture, il, active.x, active.norm, start, count);
             DS41_STAGE("hc/engram");
             for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
                 row.pos = start + t;
@@ -41755,7 +41777,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows);
         for (int i = 0; ok && i < count; i++)
             ok = ds41_dspark_capture_rows(graphs[i]->dspark_capture, il,
-                                           g->rows_view[i].residual, positions[i], 1);
+                                           g->rows_view[i].residual, positions[i], 1) &&
+                ds41_dspark_observe_inputs(graphs[i]->dspark_capture, il,
+                                           g->rows_view[i].x, g->rows_view[i].norm, positions[i], 1);
         if (ok) ok = ds41_attention_project_batch(g, model, l, rows);
         for (int i = 0; ok && i < count; i++) {
             ds41_gpu_graph row = *graphs[i];

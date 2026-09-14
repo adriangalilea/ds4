@@ -63,6 +63,23 @@ done:
 }
 
 typedef struct {
+    ds4_gpu_tensor *value[4];
+    uint8_t seen[4][3][384];
+    uint32_t start, count;
+} tap_trace;
+
+static bool capture_tap(void *ud, uint32_t layer, uint32_t pos, uint32_t kind,
+                         const ds4_gpu_tensor *src, uint64_t offset, uint64_t bytes) {
+    tap_trace *t = ud;
+    if (layer < 37 || layer > 39 || pos < t->start || pos - t->start >= t->count) return true;
+    if (kind >= 4 || bytes != (kind ? 1u : 4u) * DS4_N_EMBD * sizeof(float)) return false;
+    const uint32_t row = pos - t->start, tap = layer - 37u;
+    if (!ds4_gpu_tensor_copy(t->value[kind], ((uint64_t)row * 3u + tap) * bytes, src, offset, bytes)) return false;
+    t->seen[kind][tap][row] = 1;
+    return true;
+}
+
+typedef struct {
     ds4_gpu_tensor *tensor[32];
     char name[32][64];
     uint64_t bytes[32];
@@ -106,7 +123,9 @@ static int check_live(const char *target_path, const char *support_path,
     ds4_dspark_weights dw = {0};
     ds41_dspark_graph draft = {0};
     draft_trace trace = {0};
+    tap_trace taps = {0};
     const char *dump_root = getenv("DS4_DSPARK_DUMP_DIR");
+    const char *tap_root = getenv("DS4_DSPARK_TAP_DUMP_DIR");
     ds4_gpu_tensor *last = NULL;
     ds4_tokens tokens = {0};
     char *prompt = NULL, err[256] = {0};
@@ -128,6 +147,18 @@ static int check_live(const char *target_path, const char *support_path,
                                           support.size - support.tensor_data_pos, support.max_tensor_bytes));
         CHECK(ds41_dspark_capture_alloc(&session->ds41_graph, &dw));
         CHECK(ds41_dspark_alloc(&draft, &dw));
+        if (tap_root) {
+            CHECK(tokens.len >= 128);
+            taps.start = (uint32_t)tokens.len - 128u;
+            taps.count = 128u + 255u;
+            for (unsigned kind = 0; kind < 4; kind++) {
+                taps.value[kind] = ds4_gpu_tensor_alloc((uint64_t)taps.count * 3u *
+                    (kind ? 1u : 4u) * DS4_N_EMBD * sizeof(float));
+                CHECK(taps.value[kind]);
+            }
+            session->ds41_graph.dspark_capture->observe = capture_tap;
+            session->ds41_graph.dspark_capture->observe_ud = &taps;
+        }
     }
     CHECK(ds4_session_sync(session, &tokens, err, sizeof(err)) == 0);
     if (capture) CHECK(ds41_dspark_seed_capture(&draft, &support,
@@ -196,6 +227,24 @@ static int check_live(const char *target_path, const char *support_path,
     for (uint32_t i = 0; i < 256; i++) fprintf(stderr, "%s%d", i ? "," : "", generated[i]);
     fputc('\n', stderr);
     if (capture) {
+        if (tap_root) {
+            const char *names[] = {"raw_hc.f32", "mean.f32", "collapsed.f32", "normalized.f32"};
+            for (unsigned kind = 0; kind < 4; kind++) {
+                for (unsigned tap = 0; tap < 3; tap++)
+                    for (unsigned row = 0; row < taps.count; row++) CHECK(taps.seen[kind][tap][row]);
+                CHECK(write_tensor(tap_root, names[kind], taps.value[kind],
+                    (uint64_t)taps.count * 3u * (kind ? 1u : 4u) * DS4_N_EMBD * sizeof(float)));
+            }
+            char path[4096];
+            CHECK(snprintf(path, sizeof(path), "%s/meta.json", tap_root) < (int)sizeof(path));
+            FILE *fp = fopen(path, "w");
+            CHECK(fp);
+            fprintf(fp, "{\"start\":%u,\"rows\":%u,\"first_generation_row\":127,\"layers\":[37,38,39],\"dim\":5120,\"hc\":4,\"generated\":[",
+                    taps.start, taps.count);
+            for (unsigned i = 0; i < 256; i++) fprintf(fp, "%s%d", i ? "," : "", generated[i]);
+            fprintf(fp, "],\"pre_engram\":\"raw_hc.f32\",\"post_engram\":\"raw_hc.f32\",\"engram_on_tapped_layers\":false}\n");
+            CHECK(fclose(fp) == 0);
+        }
         uint32_t prefix_total = 0, hist[6] = {0};
         for (uint32_t i = 0; i < 251; i++) {
             uint32_t n = 0;
@@ -226,6 +275,7 @@ done:
     if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
     ds4_gpu_tensor_free(last);
     free_trace(&trace);
+    for (unsigned i = 0; i < 4; i++) ds4_gpu_tensor_free(taps.value[i]);
     ds41_dspark_free(&draft);
     ds4_session_free(session);
     ds4_engine_close(engine);
