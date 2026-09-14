@@ -39886,6 +39886,8 @@ static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
               ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, w->output_norm) &&
               ds41_output_projection(g, g->tp_logits_half ? g->tp_logits_half : g->logits,
                                       m, w, g->norm, 1);
+    if (ok && metal_graph_gpu_stage_timestamps())
+        ok = ds4_gpu_stage_flush("v41", "logits", DS4_N_LAYER, g->pos, 1) != 0;
     if (!ds4_gpu_end_commands()) ok = false;
     return ok && ds4_gpu_tensor_read(g->logits, 0, logits,
                                      (uint64_t)DS4_N_VOCAB * sizeof(float));
@@ -40196,10 +40198,23 @@ static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
         ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float));
 }
 
+/* DS4_METAL_GPU_STAGE_TIMESTAMPS splits the token's command stream at these
+ * boundaries so ds4_gpu_stage_report attributes GPU busy time per stage
+ * (part "v41"; a tag names the work emitted since the previous boundary).
+ * Off, the layer is one uninterrupted stream. */
+static bool ds41_stage(uint32_t il, uint32_t pos, const char *stage) {
+    if (!metal_graph_gpu_stage_timestamps_layer(il)) return true;
+    return ds4_gpu_stage_flush("v41", stage, il, pos, 1) != 0;
+}
+
 static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
                             const ds4_layer_weights *l, uint32_t il, int token) {
-    return ds41_graph_before_moe(g, m, l, il) && ds41_moe(g, m, l, il, (uint32_t)token) &&
-        ds41_graph_after_moe(g);
+    return ds41_stage(il, g->pos, "before") &&
+        ds41_graph_before_attention(g, m, l, il) && ds41_stage(il, g->pos, "pre_attn") &&
+        ds41_attention(g, m, l, il, false) && ds41_stage(il, g->pos, "attention") &&
+        ds41_graph_after_attention(g, m, l) && ds41_stage(il, g->pos, "post_attn") &&
+        ds41_moe(g, m, l, il, (uint32_t)token) && ds41_stage(il, g->pos, "moe") &&
+        ds41_graph_after_moe(g) && ds41_stage(il, g->pos, "after_moe");
 }
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -40335,8 +40350,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
      * layer mapped, using the same admitted reserve as layer-major prefill. */
     const bool layer_resident = g->streaming && g->quality;
     if (layer_resident && !ds4_gpu_end_commands()) ok = false;
-    const bool queue_layers = g->tp_world == 2 && !g->imatrix &&
-        !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE");
+    /* Single-box Metal drains (commit + wait) after every layer by default:
+     * 40 CPU<->GPU round trips per token.  DS4_METAL_V41_DECODE_QUEUE keeps
+     * the token's command buffers queued like the TP path and drains only
+     * where the graph needs it (layer 13, the last layer). */
+    const bool queue_layers = !g->imatrix &&
+        (g->tp_world == 2 ? !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE")
+                          : getenv("DS4_METAL_V41_DECODE_QUEUE") != NULL);
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (layer_resident)
@@ -40369,6 +40389,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
     if (ok && logits) ok = ds41_graph_logits(g, m, w, logits);
+    if (metal_graph_gpu_stage_timestamps()) ds4_gpu_stage_report("decode", g->pos, 1);
     if (!ok) {
         g->valid = false;
         return false;
