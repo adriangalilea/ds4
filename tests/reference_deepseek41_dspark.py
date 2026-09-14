@@ -89,11 +89,12 @@ class Weights:
         self.native = native
         self.db = SourceDB(str(source), index_validator=lambda _: None,
             scale_validator=lambda t: validate_scales(t, True),
-            tensor_filter=lambda n: n.startswith("mtp.") or n == "head.weight")
+            tensor_filter=lambda n: n.startswith("mtp.") or n in ("head.weight", "embed.weight"))
         self.q = NativeQuantizer(str(ROOT / "gguf-tools/libds4quants.dylib"))
         plan = build_plan(self.db, json.loads((source / "config.json").read_text()), "q4", True)
         self.types = {}
         self.types["head.weight"] = 8
+        self.types["embed.weight"] = 1
         for item in plan:
             if item.is_expert:
                 for expert in range(item.expert_count):
