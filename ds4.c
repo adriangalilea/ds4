@@ -40754,10 +40754,13 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_forward(ds41_dspark_graph *d,
     for (uint32_t i = 1; i < count; i++) tokens[i] = (int32_t)dw->noise_token_id;
     bool ok = ds4_gpu_tensor_write(g->prefill_tokens, 0, tokens, count * sizeof(int32_t)) &&
         ds4_gpu_begin_commands() && ds41_dspark_main(d, m, hidden, 1) &&
-        ds4_gpu_embed_tokens_quant_tensor(b->x, g->prefill_tokens, target->map, target->size,
+        (target_weights->token_embd->type == DS4_TENSOR_F16 ?
+         ds4_gpu_embed_tokens_hc_tensor(b->residual, g->prefill_tokens, target->map, target->size,
+            target_weights->token_embd->abs_offset, DS4_N_VOCAB, count, DS4_N_EMBD, DS4_N_HC) :
+         ds4_gpu_embed_tokens_quant_tensor(b->x, g->prefill_tokens, target->map, target->size,
             target_weights->token_embd->abs_offset, target_weights->token_embd->type,
             DS4_N_VOCAB, count, DS4_N_EMBD) &&
-        ds4_gpu_repeat_hc_rows_tensor(b->residual, b->x, count, DS4_N_EMBD, DS4_N_HC);
+         ds4_gpu_repeat_hc_rows_tensor(b->residual, b->x, count, DS4_N_EMBD, DS4_N_HC));
     for (uint32_t stage = 0; ok && stage < dw->n_stages; stage++) {
         const ds4_layer_weights *l = &dw->stage[stage].block;
         ok = ds41_hc_before_attention_batch(b, m, l, stage == 0, count) &&
@@ -40785,9 +40788,12 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_forward(ds41_dspark_graph *d,
         ds4_gpu_tensor *logits = ds4_gpu_tensor_view(d->base_logits, i * logits_bytes, logits_bytes);
         ds4_gpu_tensor *score = ds4_gpu_tensor_view(d->confidence, i * sizeof(float), sizeof(float));
         ok = logits && score && ds4_gpu_begin_commands() &&
-            ds4_gpu_embed_token_quant_tensor(d->markov, m->map, m->size,
+            (final->markov_w1->type == DS4_TENSOR_F16 ?
+             ds4_gpu_embed_token_hc_tensor(d->markov, m->map, m->size,
+                final->markov_w1->abs_offset, DS4_N_VOCAB, (uint32_t)previous, dw->markov_rank, 1) :
+             ds4_gpu_embed_token_quant_tensor(d->markov, m->map, m->size,
                 final->markov_w1->abs_offset, final->markov_w1->type,
-                DS4_N_VOCAB, (uint32_t)previous, dw->markov_rank) &&
+                DS4_N_VOCAB, (uint32_t)previous, dw->markov_rank)) &&
             ds41_matmul(d->bias, m, final->markov_w2, d->markov, false) &&
             ds4_gpu_add_tensor(d->bias, logits, d->bias, DS4_N_VOCAB) &&
             ds4_gpu_argmax_tensor(d->top, d->bias, DS4_N_VOCAB) &&
