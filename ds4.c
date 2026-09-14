@@ -39849,6 +39849,14 @@ static bool ds41_router_fused(const ds41_gpu_graph *g, const ds4_layer_weights *
     return enabled && ds41_hc_fused(g) && l->ffn_gate_inp->type == DS4_TENSOR_F32;
 }
 
+/* Diagnostic: run the shared down projection (standalone matvec + BF16)
+ * before the routed experts instead of inside the fused FFN tail. */
+static bool ds41_shared_down_early(void) {
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("DS4_METAL_V41_SHARED_DOWN_EARLY") != NULL;
+    return enabled;
+}
+
 /* Shared expert gate/up/SwiGLU as one dispatch and its down projection
  * folded into the FFN tail (ds41_moe_finish / ds41_graph_after_moe agree). */
 static bool ds41_moe_fused(const ds41_gpu_graph *g, const ds4_layer_weights *l) {
@@ -39898,6 +39906,8 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         (!ds4_gpu_dsv41_shared_gate_up_swiglu(g->shared_mid, g->norm, m->map, m->size,
              l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
              DS4_N_EMBD, DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP) ||
+         (ds41_shared_down_early() &&
+          !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true)) ||
          !ds41_stage(il, g->pos, "moe_shared"))) return false;
     if (fused) shared_queued = true;
 #endif
@@ -40026,7 +40036,7 @@ static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
                                       const ds4_layer_weights *l) {
 #if defined(__APPLE__)
     if (ds41_hc_fused(g))
-        return ds4_gpu_dsv41_hc_expand4(g->after_attn, g->block, g->residual, g->attn_split, NULL, DS4_N_EMBD) &&
+        return ds4_gpu_dsv41_hc_expand4(g->after_attn, g->block, g->residual, g->attn_split, NULL, NULL, NULL, DS4_N_EMBD) &&
             ds41_hc_mix_fused(g, m, l->hc_ffn_fn, g->after_attn) &&
             ds41_hc_collapse_norm_fused(g, m, l, true);
 #endif
@@ -40317,7 +40327,7 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
 static bool ds41_hc_expand_after_moe(ds41_gpu_graph *g) {
 #if defined(__APPLE__)
     if (ds41_hc_fused(g))
-        return ds4_gpu_dsv41_hc_expand4(g->residual, g->block, g->after_attn, g->ffn_split, g->pre, DS4_N_EMBD);
+        return ds4_gpu_dsv41_hc_expand4(g->residual, g->block, g->after_attn, g->ffn_split, g->pre, NULL, NULL, DS4_N_EMBD);
 #endif
     return ds4_gpu_hc_expand_split_tensor(g->residual, g->block, g->after_attn, g->ffn_split, DS4_N_EMBD, DS4_N_HC) &&
         ds41_bf16(g->residual, DS4_N_EMBD * DS4_N_HC) &&
@@ -40330,10 +40340,14 @@ static bool ds41_hc_expand_after_moe(ds41_gpu_graph *g) {
 static bool ds41_graph_after_moe(ds41_gpu_graph *g, const ds4_model *m,
                                  const ds4_layer_weights *l) {
 #if defined(__APPLE__)
-    if (ds41_moe_fused(g, l))
+    if (ds41_moe_fused(g, l)) {
+        if (ds41_shared_down_early())
+            return ds4_gpu_dsv41_hc_expand4(g->residual, g->routed, g->after_attn, g->ffn_split,
+                g->pre, g->shared, g->block, DS4_N_EMBD) != 0;
         return ds4_gpu_dsv41_shared_down_hc_expand4(g->residual, g->shared, g->block,
             g->shared_mid, g->routed, g->after_attn, g->ffn_split, g->pre, m->map, m->size,
             l->ffn_down_shexp->abs_offset, DS4_N_EMBD, DS4_N_FF_EXP) != 0;
+    }
 #else
     (void)m; (void)l;
 #endif

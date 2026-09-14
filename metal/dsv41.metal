@@ -309,6 +309,7 @@ struct ds4_metal_args_dsv41_hc {
     float hc_eps;
     float norm_eps;
     uint  copy_pre;
+    uint  has_add;
 };
 
 static inline float4 dsv41_bf16x4(float4 v) {
@@ -436,20 +437,29 @@ kernel void kernel_dsv41_hc_collapse_norm4(
 
 /* out[h] = bf16(post[h] * block + sum_s comb[h, s] * residual[s]) for the
  * four streams, kernel_dsv4_hc_expand4's index arithmetic and accumulation
- * order; copy_pre also carries split[0..3] into `pre` for the next layer. */
+ * order; copy_pre also carries split[0..3] into `pre` for the next layer.
+ * has_add: block = bf16(block_in + add) first (the routed + shared sum and
+ * its rounding), written back to block_sum. */
 kernel void kernel_dsv41_hc_expand4_bf16(
         constant ds4_metal_args_dsv41_hc &args,
-        device const float *block_out,
+        device const float *block_in,
         device const float *residual,
         device const float *split,
         device       float *out,
         device       float *pre_out,
+        device const float *add,
+        device       float *block_sum,
         uint d [[thread_position_in_grid]]) {
     if (d >= args.n_embd) return;
     device const float *post = split + 4;
     device const float *comb = split + 8;
 
-    const float block_v = block_out[d];
+    float block_v = block_in[d];
+    if (args.has_add) {
+        block_v += add[d];
+        block_v = dsv41_bf16(block_v);
+        block_sum[d] = block_v;
+    }
     const float r0 = residual[d];
     const float r1 = residual[d + args.n_embd];
     const float r2 = residual[d + 2u * args.n_embd];
