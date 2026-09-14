@@ -401,6 +401,123 @@ static int check_hc_fuse(void) {
     return 1;
 }
 
+static void fill_q8_0(uint8_t *dst, size_t rows, size_t k) {
+    for (size_t r = 0; r < rows; r++) for (size_t b = 0; b < k / 32; b++) {
+        uint8_t *block = dst + (r * (k / 32) + b) * 34;
+        const _Float16 d = (_Float16)(random_value() / 512 + 0.01f);
+        memcpy(block, &d, 2);
+        for (int i = 0; i < 32; i++) block[2 + i] = (uint8_t)(int8_t)(random_value() * 30);
+    }
+}
+
+/* The fused decode MoE glue (router + select, shared gate/up/SwiGLU, shared
+ * down + sum + HC expand) must be byte-identical to the 22-dispatch
+ * standalone sequence at V4.1's shape (5120 x 384 F32 router, 6 of 384,
+ * scale 1.5, Q8_0 shared expert of 2304). */
+static int check_moe_fuse(void) {
+    enum { D = 5120, HC = 4, N = HC * D, E = 384, K = 6, FF = 2304 };
+    const float scale = 1.5f, clamp = 10.0f;
+    const size_t router_bytes = (size_t)D * E * 4, bias_bytes = E * 4;
+    const size_t gate_bytes = (size_t)FF * (D / 32) * 34, down_bytes = (size_t)D * (FF / 32) * 34;
+    const size_t router_off = 0, bias_off = router_bytes, gate_off = bias_off + bias_bytes;
+    const size_t up_off = gate_off + gate_bytes, down_off = up_off + gate_bytes;
+    const size_t page = (size_t)getpagesize();
+    const size_t mapped = (down_off + down_bytes + page - 1) / page * page;
+    void *model = NULL;
+    CHECK(!posix_memalign(&model, page, mapped));
+    float *router = model, *bias = (float *)((char *)model + bias_off);
+    for (size_t i = 0; i < (size_t)D * E; i++) router[i] = random_value() / 64;
+    /* Repeated bias values: with a zero input every score ties within its
+     * group and the canonical order (ascending index among equals) is what
+     * the standalone argsort produces. */
+    for (int i = 0; i < E; i++) bias[i] = (float)(i % 5) / 10;
+    fill_q8_0((uint8_t *)model + gate_off, FF, D);
+    fill_q8_0((uint8_t *)model + up_off, FF, D);
+    fill_q8_0((uint8_t *)model + down_off, D, FF);
+    CHECK(ds4_gpu_set_model_map(model, mapped));
+
+    ds4_gpu_tensor *norm = upload(NULL, D * 4), *routed = upload(NULL, D * 4);
+    ds4_gpu_tensor *residual = upload(NULL, N * 4), *split = upload(NULL, 24 * 4);
+    ds4_gpu_tensor *logits[2] = {upload(NULL, E * 4), upload(NULL, E * 4)};
+    ds4_gpu_tensor *probs[2] = {upload(NULL, E * 4), upload(NULL, E * 4)};
+    ds4_gpu_tensor *selected[2] = {upload(NULL, K * 4), upload(NULL, K * 4)};
+    ds4_gpu_tensor *weights[2] = {upload(NULL, K * 4), upload(NULL, K * 4)};
+    ds4_gpu_tensor *gate = upload(NULL, FF * 4), *up = upload(NULL, FF * 4);
+    ds4_gpu_tensor *mid[2] = {upload(NULL, FF * 4), upload(NULL, FF * 4)};
+    ds4_gpu_tensor *shared[2] = {upload(NULL, D * 4), upload(NULL, D * 4)};
+    ds4_gpu_tensor *block[2] = {upload(NULL, D * 4), upload(NULL, D * 4)};
+    ds4_gpu_tensor *out[2] = {upload(NULL, N * 4), upload(NULL, N * 4)};
+    ds4_gpu_tensor *pre[2] = {upload(NULL, 16), upload(NULL, 16)};
+    CHECK(norm && routed && residual && split && gate && up);
+    for (int i = 0; i < 2; i++)
+        CHECK(logits[i] && probs[i] && selected[i] && weights[i] && mid[i] && shared[i] && block[i] && out[i] && pre[i]);
+    float *x = ds4_gpu_tensor_contents(norm), *r = ds4_gpu_tensor_contents(routed);
+    float *res = ds4_gpu_tensor_contents(residual), *s = ds4_gpu_tensor_contents(split);
+    double elapsed[2] = {0};
+    for (int round = 0; round < 8; round++) {
+        const int ties = round == 3 || round == 7;
+        for (int i = 0; i < D; i++) x[i] = ties ? 0.0f : bf16(random_value());
+        for (int i = 0; i < D; i++) r[i] = bf16(random_value());
+        for (int i = 0; i < N; i++) res[i] = bf16(random_value());
+        for (int i = 0; i < 24; i++) s[i] = i < 4 ? 0.5f + random_value() / 8 : i < 8 ? 1.0f + random_value() / 4 : 0.25f + random_value() / 16;
+        for (int mode = 0; mode < 2; mode++) {
+            const double begin = monotonic_seconds();
+            CHECK(ds4_gpu_begin_commands());
+            if (mode == 0) {
+                CHECK(ds4_gpu_matmul_f32_tensor(logits[0], model, mapped, router_off, D, E, norm, 1));
+                CHECK(ds4_gpu_router_select_tensor(selected[0], weights[0], probs[0], model, mapped,
+                    bias_off, 0, 0, 0, E, K, scale, 0, 0, true, false, logits[0]));
+                CHECK(ds4_gpu_matmul_q8_0_tensor(gate, model, mapped, gate_off, D, FF, norm, 1));
+                CHECK(ds4_gpu_dsv41_quantize(gate, FF, 1, DS4_V41_BF16));
+                CHECK(ds4_gpu_matmul_q8_0_tensor(up, model, mapped, up_off, D, FF, norm, 1));
+                CHECK(ds4_gpu_dsv41_quantize(up, FF, 1, DS4_V41_BF16));
+                CHECK(ds4_gpu_swiglu_tensor(mid[0], gate, up, FF, clamp, 1.0f));
+                CHECK(ds4_gpu_dsv41_quantize(mid[0], FF, 1, DS4_V41_BF16));
+                CHECK(ds4_gpu_matmul_q8_0_tensor(shared[0], model, mapped, down_off, FF, D, mid[0], 1));
+                CHECK(ds4_gpu_dsv41_quantize(shared[0], D, 1, DS4_V41_BF16));
+                CHECK(ds4_gpu_add_tensor(block[0], routed, shared[0], D));
+                CHECK(ds4_gpu_dsv41_quantize(block[0], D, 1, DS4_V41_BF16));
+                CHECK(ds4_gpu_hc_expand_split_tensor(out[0], block[0], residual, split, D, HC));
+                CHECK(ds4_gpu_dsv41_quantize(out[0], N, 1, DS4_V41_BF16));
+                CHECK(ds4_gpu_tensor_copy(pre[0], 0, split, 0, 16));
+            } else {
+                CHECK(ds4_gpu_dsv41_router_select(selected[1], weights[1], probs[1], logits[1], norm,
+                    model, mapped, router_off, bias_off, true, D, E, K, scale));
+                CHECK(ds4_gpu_dsv41_shared_gate_up_swiglu(mid[1], norm, model, mapped, gate_off, up_off, D, FF, clamp));
+                CHECK(ds4_gpu_dsv41_shared_down_hc_expand4(out[1], shared[1], block[1], mid[1], routed,
+                    residual, split, pre[1], model, mapped, down_off, D, FF));
+            }
+            CHECK(ds4_gpu_end_commands());
+            CHECK(ds4_gpu_synchronize());
+            if (round) elapsed[mode] += (monotonic_seconds() - begin) * 1000.0 / 7;
+        }
+        const int32_t *sel = ds4_gpu_tensor_contents(selected[1]);
+        for (int i = 0; i < K; i++) CHECK(sel[i] >= 0 && sel[i] < E);
+        if (ties) for (int i = 0; i < K; i++) CHECK(sel[i] == 4 + 5 * i);
+        CHECK(!memcmp(ds4_gpu_tensor_contents(logits[0]), ds4_gpu_tensor_contents(logits[1]), E * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(probs[0]), ds4_gpu_tensor_contents(probs[1]), E * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(selected[0]), sel, K * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(weights[0]), ds4_gpu_tensor_contents(weights[1]), K * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(mid[0]), ds4_gpu_tensor_contents(mid[1]), FF * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(shared[0]), ds4_gpu_tensor_contents(shared[1]), D * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(block[0]), ds4_gpu_tensor_contents(block[1]), D * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(out[0]), ds4_gpu_tensor_contents(out[1]), N * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(pre[0]), ds4_gpu_tensor_contents(pre[1]), 16));
+    }
+    fprintf(stderr, "MoE fuse: 15 dispatches %.3f ms -> 3 dispatches %.3f ms, outputs byte-identical\n",
+            elapsed[0], elapsed[1]);
+    for (int i = 0; i < 2; i++) {
+        ds4_gpu_tensor_free(logits[i]); ds4_gpu_tensor_free(probs[i]); ds4_gpu_tensor_free(selected[i]);
+        ds4_gpu_tensor_free(weights[i]); ds4_gpu_tensor_free(mid[i]); ds4_gpu_tensor_free(shared[i]);
+        ds4_gpu_tensor_free(block[i]); ds4_gpu_tensor_free(out[i]); ds4_gpu_tensor_free(pre[i]);
+    }
+    ds4_gpu_tensor_free(norm); ds4_gpu_tensor_free(routed); ds4_gpu_tensor_free(residual);
+    ds4_gpu_tensor_free(split); ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(up);
+    ds4_gpu_cleanup(); free(model);
+    CHECK(ds4_gpu_init());
+    return 1;
+}
+
 #endif
 
 static int check_engram(void) {
@@ -1369,6 +1486,11 @@ int main(int argc, char **argv) {
         ds4_gpu_cleanup();
         return ok ? 0 : 1;
     }
+    if (argc == 2 && !strcmp(argv[1], "--moe-fuse")) {
+        const int ok = ds4_gpu_init() && check_moe_fuse();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
 #endif
     if (argc == 2 && !strcmp(argv[1], "--bf16-linear")) {
         const int ok = ds4_gpu_init() && check_bf16_linear();
@@ -1406,7 +1528,7 @@ int main(int argc, char **argv) {
              check_embedding() && check_index_projection() && check_general_topk() && check_causal_topk() && check_compact_carry() && check_attention_output(false) &&
              check_tp_attention();
 #ifdef __APPLE__
-    ok = ok && check_hc_fuse();
+    ok = ok && check_hc_fuse() && check_moe_fuse();
 #endif
     ds4_gpu_cleanup();
     return ok ? 0 : 1;
