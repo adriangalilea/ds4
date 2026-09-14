@@ -210,6 +210,12 @@ static int check_static_batch(bool q4) {
     setenv("DS4_TP_NO_KEEPALIVE", "1", 1);
     for (int rank = q4 ? -1 : 0; rank < 2 && ok; rank++) {
         if (rank >= 0) ok = ds4_gpu_tp_init((uint32_t)rank, NULL, 0, 0, 0, NULL, NULL);
+        /* Use two-row group6 as the oracle for the one-row specialization.
+         * Explicitly enable group6 so this also exercises standalone PRs. */
+        if (q4) {
+            setenv("DS4_METAL_ENABLE_Q4_GROUP6_EXPERT_TABLE", "1", 1);
+            setenv("DS4_METAL_DISABLE_V41_Q4_SINGLE_ROW", "1", 1);
+        }
         for (uint32_t r = 0; r < N && ok; r++) {
             ds4_gpu_tensor *xr = ds4_gpu_tensor_view(xt, r * D * sizeof(float), D * sizeof(float));
             ds4_gpu_tensor *ir = ds4_gpu_tensor_view(it, r * SELECTED * sizeof(int32_t), SELECTED * sizeof(int32_t));
@@ -223,6 +229,7 @@ static int check_static_batch(bool q4) {
             ds4_gpu_tensor_free(ir);
             ds4_gpu_tensor_free(wr);
         }
+        if (q4) unsetenv("DS4_METAL_DISABLE_V41_Q4_SINGLE_ROW");
         const uint32_t sizes[] = {6, 2, 5, 3, 4, 6};
         const uint32_t q4_sizes[] = {8, 1, 2, 3, 4, 5, 6, 7, 8};
         const unsigned n_sizes = q4 ? sizeof(q4_sizes) / sizeof(*q4_sizes) : sizeof(sizes) / sizeof(*sizes);
@@ -242,6 +249,7 @@ static int check_static_batch(bool q4) {
                 if (!ok) fprintf(stderr, "decode mismatch index=%u expected=%.9g actual=%.9g\n",
                     j, j < n * D ? reference[j] : NAN, actual[j]);
             }
+            if (q4 && ok) ok = memcmp(actual, reference, n * D * sizeof(float)) == 0;
             fprintf(stderr, "%s static batch rank=%d rows=%u exact: %s\n",
                 q4 ? "V4.1 Q4" : "MXFP4", rank, n, ok ? "PASS" : "FAIL");
         }

@@ -5367,6 +5367,7 @@ static inline device const char *ds4_q4_group24_select(
     }
 }
 
+template<short NR0>
 kernel void kernel_mul_mv_group6_q4_K_pair_swiglu_f32(
         constant ds4_metal_args_mul_mv_id & args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
@@ -5439,7 +5440,7 @@ kernel void kernel_mul_mv_group6_q4_K_pair_swiglu_f32(
         args.ne0, 1, args.nr0, 1, 1,
     };
 
-    kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(
+    kernel_mul_mv_q4_K_f32_impl<NR0>(
         args0,
         src0_gate_cur,
         src1_cur,
@@ -5448,7 +5449,7 @@ kernel void kernel_mul_mv_group6_q4_K_pair_swiglu_f32(
         tgpig,
         tiisg,
         sgitg);
-    kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K>(
+    kernel_mul_mv_q4_K_f32_impl<NR0>(
         args0,
         src0_up_cur,
         src1_cur,
@@ -5459,7 +5460,7 @@ kernel void kernel_mul_mv_group6_q4_K_pair_swiglu_f32(
         sgitg);
 
     const short NSG = FC_mul_mv_nsg;
-    const int first_row = (tgpig.x * NSG + sgitg) * N_R0_Q4_K;
+    const int first_row = (tgpig.x * NSG + sgitg) * NR0;
     device float *gate_f32 = (device float *)dst_gate_cur;
     device float *up_f32 = (device float *)dst_up_cur;
     const uint64_t pair_row = (uint64_t)i12 * (uint64_t)args.nei0 + (uint64_t)idx;
@@ -5469,7 +5470,7 @@ kernel void kernel_mul_mv_group6_q4_K_pair_swiglu_f32(
     const float route_weight = route_w[0];
 
     if (tiisg == 0) {
-        for (int row = 0; row < N_R0_Q4_K && first_row + row < args.ne0; ++row) {
+        for (int row = 0; row < NR0 && first_row + row < args.ne0; ++row) {
             const uint out_row = first_row + row;
             float g = gate_f32[out_row];
             float u = up_f32[out_row];
@@ -5484,6 +5485,35 @@ kernel void kernel_mul_mv_group6_q4_K_pair_swiglu_f32(
 
     (void)tiitg;
 }
+
+typedef void kernel_mul_mv_group6_q4_K_pair_swiglu_f32_t(
+        constant ds4_metal_args_mul_mv_id & args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
+        device const char * src0_gate0,
+        device const char * src0_gate1,
+        device const char * src0_gate2,
+        device const char * src0_gate3,
+        device const char * src0_gate4,
+        device const char * src0_gate5,
+        device const char * src0_up0,
+        device const char * src0_up1,
+        device const char * src0_up2,
+        device const char * src0_up3,
+        device const char * src0_up4,
+        device const char * src0_up5,
+        device const char * src1,
+        device char * dst_gate,
+        device char * dst_up,
+        device char * dst_mid,
+        device const char * ids,
+        device const char * weights,
+        threadgroup char * shmem,
+        uint3 tgpig,
+        ushort tiitg,
+        ushort tiisg,
+        ushort sgitg);
+template [[host_name("kernel_mul_mv_group6_q4_K_pair_swiglu_f32_r1")]] kernel kernel_mul_mv_group6_q4_K_pair_swiglu_f32_t kernel_mul_mv_group6_q4_K_pair_swiglu_f32<1>;
+template [[host_name("kernel_mul_mv_group6_q4_K_pair_swiglu_f32")]] kernel kernel_mul_mv_group6_q4_K_pair_swiglu_f32_t kernel_mul_mv_group6_q4_K_pair_swiglu_f32<2>;
 
 kernel void kernel_mul_mv_group8_q4_K_pair_swiglu_f32(
         constant ds4_metal_args_mul_mv_id & args,
@@ -7318,6 +7348,7 @@ kernel void kernel_mul_mv_slots6_q4_K_sum6_f32(
     (void)tgpig;
 }
 
+template<short NR0>
 kernel void kernel_mul_mv_group6_q4_K_sum6_f32(
         constant ds4_metal_args_mul_mv_id & args,
         device const char * src00,
@@ -7336,7 +7367,7 @@ kernel void kernel_mul_mv_group6_q4_K_sum6_f32(
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     constexpr uint32_t expert_group_size = 64;
     const short NSG = FC_mul_mv_nsg;
-    const short nr0 = N_R0_Q4_K;
+    const short nr0 = NR0;
     const int nb = args.ne00 / QK_K;
     const int first_row = (tgpig.x * NSG + sgitg) * nr0;
     const uint token = tgpig.y;
@@ -7449,6 +7480,25 @@ kernel void kernel_mul_mv_group6_q4_K_sum6_f32(
     (void)tiitg;
     (void)tgpig;
 }
+
+typedef void kernel_mul_mv_group6_q4_K_sum6_f32_t(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src00,
+        device const char * src01,
+        device const char * src02,
+        device const char * src03,
+        device const char * src04,
+        device const char * src05,
+        device const char * src1,
+        device char * dst,
+        device const char * ids,
+        threadgroup char * shmem,
+        uint3 tgpig,
+        ushort tiitg,
+        ushort tiisg,
+        ushort sgitg);
+template [[host_name("kernel_mul_mv_group6_q4_K_sum6_f32_r1")]] kernel kernel_mul_mv_group6_q4_K_sum6_f32_t kernel_mul_mv_group6_q4_K_sum6_f32<1>;
+template [[host_name("kernel_mul_mv_group6_q4_K_sum6_f32")]] kernel kernel_mul_mv_group6_q4_K_sum6_f32_t kernel_mul_mv_group6_q4_K_sum6_f32<2>;
 
 kernel void kernel_mul_mv_group8_q4_K_sum6_f32(
         constant ds4_metal_args_mul_mv_id & args,
