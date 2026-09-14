@@ -54,7 +54,7 @@ def main():
         identical = sum(proposals[i] == expected for i, expected in oracle.items())
         if name == "mean":
             assert identical == 251, f"Replay differs from Studio at {251-identical} positions; ablations stopped"
-        first = sum(proposals[i][0] == seeds[i + 1] for i in range(255))
+        first = sum(int(proposals[i][0] == seeds[i + 1]) for i in range(255))
         hist = [0] * 6
         for i in range(251):
             n = 0
