@@ -52,6 +52,17 @@ def check_payload(fp, offset, item, db, quantizer, imatrix):
             raise ValueError(f"{item.name}: payload differs from source recipe")
 
 
+def read_metadata(fp, kind, expected):
+    if isinstance(expected, list):
+        if kind != 9 or read_u32(fp, "array element type") != 4:
+            raise ValueError("expected UINT32 metadata array")
+        count = read_u64(fp, "array length")
+        if count != len(expected):
+            raise ValueError("metadata array length mismatch")
+        return [read_u32(fp, "array element") for _ in range(count)]
+    return read_selected_metadata(fp, kind)
+
+
 def validate(args):
     config = json.loads((Path(args.hf) / "config.json").read_text())
     support = getattr(args, "dspark_support", False)
@@ -89,7 +100,7 @@ def validate(args):
                 if key in expected:
                     if key in metadata:
                         raise ValueError(f"duplicate metadata: {key}")
-                    metadata[key] = read_selected_metadata(fp, kind)
+                    metadata[key] = read_metadata(fp, kind, expected[key])
                 else:
                     skip_gguf_value(fp, kind)
             if metadata != expected:

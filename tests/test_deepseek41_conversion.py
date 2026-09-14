@@ -226,6 +226,15 @@ class ConversionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "expected E8M0 scales"):
             validate_scales(db.tensors, support=True)
 
+    def test_dspark_target_layer_metadata_array(self):
+        payload = struct.pack("<IQIII", 4, 3, 37, 38, 39)
+        self.assertEqual(artifact_audit.read_metadata(io.BytesIO(payload), 9, [37, 38, 39]),
+                         [37, 38, 39])
+        with self.assertRaisesRegex(ValueError, "array length"):
+            artifact_audit.read_metadata(io.BytesIO(payload), 9, [37, 38])
+        with self.assertRaisesRegex(ValueError, "UINT32"):
+            artifact_audit.read_metadata(io.BytesIO(payload), 4, [37, 38, 39])
+
 
 def official_engram(reference_dir, library_path):
     import __future__
