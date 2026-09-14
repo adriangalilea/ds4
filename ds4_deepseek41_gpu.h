@@ -141,6 +141,27 @@ int ds4_gpu_dsv41_hc_collapse_norm(ds4_gpu_tensor *split, ds4_gpu_tensor *x, ds4
 int ds4_gpu_dsv41_hc_expand4(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
                             const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split,
                             ds4_gpu_tensor *pre, uint32_t n_embd);
+/* Decode MoE glue for one token row, byte-identical to the standalone
+ * sequences: router = F32 logits matvec + softplus/sqrt + bias + canonical
+ * top-k + normalized weights in one dispatch; shared gate/up = two Q8_0
+ * matvecs + BF16 + SwiGLU + BF16; shared down + HC tail = Q8_0 matvec +
+ * BF16 + (routed + shared) + BF16 + post/comb expand + BF16 (+ pre carry). */
+int ds4_gpu_dsv41_router_select(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights,
+                               ds4_gpu_tensor *probs, ds4_gpu_tensor *logits,
+                               const ds4_gpu_tensor *x,
+                               const void *model_map, uint64_t model_size,
+                               uint64_t weight_offset, uint64_t bias_offset, bool has_bias,
+                               uint32_t n_embd, uint32_t n_expert, uint32_t n_used, float scale);
+int ds4_gpu_dsv41_shared_gate_up_swiglu(ds4_gpu_tensor *mid, const ds4_gpu_tensor *x,
+                                       const void *model_map, uint64_t model_size,
+                                       uint64_t gate_offset, uint64_t up_offset,
+                                       uint32_t n_embd, uint32_t n_ff, float clamp);
+int ds4_gpu_dsv41_shared_down_hc_expand4(ds4_gpu_tensor *out, ds4_gpu_tensor *shared,
+                                        ds4_gpu_tensor *block, const ds4_gpu_tensor *mid,
+                                        const ds4_gpu_tensor *routed, const ds4_gpu_tensor *residual,
+                                        const ds4_gpu_tensor *split, ds4_gpu_tensor *pre,
+                                        const void *model_map, uint64_t model_size,
+                                        uint64_t down_offset, uint32_t n_embd, uint32_t n_ff);
 
 #ifdef __cplusplus
 }
