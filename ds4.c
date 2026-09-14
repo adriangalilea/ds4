@@ -40387,12 +40387,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
          * 14, and before publishing the completed token to the CPU. */
         const bool drain = !queue_layers || il == 13 || il + 1u == DS4_N_LAYER;
         if (drain && !ds4_gpu_end_commands()) ok = false;
-        /* DS4_METAL_V41_DECODE_FLUSH_LAYERS: commit the queued layer without
-         * waiting so the GPU starts it while the CPU encodes the next one
-         * (the stage-timestamp run, which commits per stage, decoded faster
-         * than the plain queued run). */
+        /* Commit the queued layer without waiting so the GPU starts it while
+         * the CPU encodes the next one: 21.6 -> 23.1 t/s on top of the queue
+         * (M3 Ultra, Q4 resident, greedy output byte-identical).
+         * DS4_METAL_DISABLE_V41_DECODE_FLUSH keeps the token in one buffer
+         * between drains. */
         if (ok && !drain && queue_layers && !layer_resident &&
-            getenv("DS4_METAL_V41_DECODE_FLUSH_LAYERS") && !ds4_gpu_flush_commands()) ok = false;
+            !getenv("DS4_METAL_DISABLE_V41_DECODE_FLUSH") && !ds4_gpu_flush_commands()) ok = false;
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
         if (ok && g->imatrix)
             ok = imatrix_collect_tensor_batch(g->imatrix, g->norm, g->mid,
