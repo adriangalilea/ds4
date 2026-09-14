@@ -291,3 +291,177 @@ kernel void kernel_dsv41_indexer_scores_packed(
     }
 }
 #endif
+
+/* Decode-time V4.1 hyper-connection glue, one token row, HC=4.
+ *
+ * The released graph runs each half-layer's HC work as separate dispatches:
+ * split/sinkhorn, the pre-weighted collapse of the four streams, a BF16
+ * rounding pass, the weighted RMSNorm and another BF16 pass (and, after the
+ * sublayer, the post/comb expand plus its BF16 pass).  DeepSeek's production
+ * decode does the whole thing in one "Mega-mHC" kernel.  These two kernels
+ * are that fusion for ds4's graph: every reduction keeps the standalone
+ * kernel's thread mapping and accumulation order, and every rounding point
+ * is the same dsv41_bf16, so the outputs are byte-identical (checked by
+ * tests/test_deepseek41_metal --hc-fuse). */
+struct ds4_metal_args_dsv41_hc {
+    uint  n_embd;
+    uint  sinkhorn_iters;
+    float hc_eps;
+    float norm_eps;
+    uint  copy_pre;
+};
+
+static inline float4 dsv41_bf16x4(float4 v) {
+    return float4(dsv41_bf16(v.x), dsv41_bf16(v.y), dsv41_bf16(v.z), dsv41_bf16(v.w));
+}
+
+/* kernel_dsv4_hc_split_sinkhorn's HC == 4 body, verbatim, on one lane. */
+static inline void dsv41_hc_split4(device const float *mix, device const float *scale,
+                                   device const float *base, device float *out,
+                                   uint sinkhorn_iters, float epsv) {
+    const float pre_scale  = scale[0];
+    const float post_scale = scale[1];
+    const float comb_scale = scale[2];
+
+    const float4 pre_z = *((device const float4 *)mix) * pre_scale + *((device const float4 *)base);
+    *((device float4 *)out) = ds4_hc_sigmoid(pre_z) + epsv;
+
+    const float4 post_z = *((device const float4 *)(mix + 4)) * post_scale + *((device const float4 *)(base + 4));
+    *((device float4 *)(out + 4)) = ds4_hc_twice_sigmoid(post_z);
+
+    float4 r0 = *((device const float4 *)(mix +  8)) * comb_scale + *((device const float4 *)(base +  8));
+    float4 r1 = *((device const float4 *)(mix + 12)) * comb_scale + *((device const float4 *)(base + 12));
+    float4 r2 = *((device const float4 *)(mix + 16)) * comb_scale + *((device const float4 *)(base + 16));
+    float4 r3 = *((device const float4 *)(mix + 20)) * comb_scale + *((device const float4 *)(base + 20));
+
+    const float m0 = max(max(r0.x, r0.y), max(r0.z, r0.w));
+    const float m1 = max(max(r1.x, r1.y), max(r1.z, r1.w));
+    const float m2 = max(max(r2.x, r2.y), max(r2.z, r2.w));
+    const float m3 = max(max(r3.x, r3.y), max(r3.z, r3.w));
+
+    r0 = exp(r0 - m0);
+    r1 = exp(r1 - m1);
+    r2 = exp(r2 - m2);
+    r3 = exp(r3 - m3);
+
+    r0 = r0 * (1.0f / (r0.x + r0.y + r0.z + r0.w)) + epsv;
+    r1 = r1 * (1.0f / (r1.x + r1.y + r1.z + r1.w)) + epsv;
+    r2 = r2 * (1.0f / (r2.x + r2.y + r2.z + r2.w)) + epsv;
+    r3 = r3 * (1.0f / (r3.x + r3.y + r3.z + r3.w)) + epsv;
+
+    float4 col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);
+    r0 *= col_inv;
+    r1 *= col_inv;
+    r2 *= col_inv;
+    r3 *= col_inv;
+
+    for (uint iter = 1; iter < sinkhorn_iters; ++iter) {
+        r0 *= 1.0f / (r0.x + r0.y + r0.z + r0.w + epsv);
+        r1 *= 1.0f / (r1.x + r1.y + r1.z + r1.w + epsv);
+        r2 *= 1.0f / (r2.x + r2.y + r2.z + r2.w + epsv);
+        r3 *= 1.0f / (r3.x + r3.y + r3.z + r3.w + epsv);
+
+        col_inv = 1.0f / (r0 + r1 + r2 + r3 + epsv);
+        r0 *= col_inv;
+        r1 *= col_inv;
+        r2 *= col_inv;
+        r3 *= col_inv;
+    }
+
+    *((device float4 *)(out +  8)) = r0;
+    *((device float4 *)(out + 12)) = r1;
+    *((device float4 *)(out + 16)) = r2;
+    *((device float4 *)(out + 20)) = r3;
+}
+
+/* split(mix) -> split_out; x = bf16(sum_h pre[h] * residual[h]); norm =
+ * bf16(rmsnorm(x) * weight).  `pre` is the coefficient row the previous
+ * sublayer produced (V4.1's single-pass mHC), not this split's.  One
+ * threadgroup of ds4_gpu_rms_norm_threads(n_embd) threads: the collapse
+ * keeps kernel_dsv4_hc_weighted_sum's per-stream order and the norm keeps
+ * kernel_rms_norm_mul_f32_4's loop, simd tree and 1/sqrt scale. */
+kernel void kernel_dsv41_hc_collapse_norm4(
+        constant ds4_metal_args_dsv41_hc &args,
+        device const float *mix,
+        device const float *scale,
+        device const float *base,
+        device const float *pre,
+        device const float4 *residual,
+        device       float *split_out,
+        device       float4 *x_out,
+        device const float4 *norm_weight,
+        device       float4 *norm_out,
+        threadgroup  float *shared [[threadgroup(0)]],
+        ushort tid   [[thread_position_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort ntg   [[threads_per_threadgroup]]) {
+    const uint n4 = args.n_embd >> 2;
+    threadgroup float4 *row = (threadgroup float4 *)shared;
+    threadgroup float *sums = shared + args.n_embd;
+
+    if (tid == 0) dsv41_hc_split4(mix, scale, base, split_out, args.sinkhorn_iters, args.hc_eps);
+    if (sgitg == 0) sums[tiisg] = 0.0f;
+
+    const float4 p = *((device const float4 *)pre);
+    device const float4 *x0 = residual;
+    device const float4 *x1 = residual + n4;
+    device const float4 *x2 = residual + 2u * n4;
+    device const float4 *x3 = residual + 3u * n4;
+    float sumf = 0.0f;
+    for (uint i = tid; i < n4; i += ntg) {
+        float4 v = 0.0f;
+        v += x0[i] * p.x;
+        v += x1[i] * p.y;
+        v += x2[i] * p.z;
+        v += x3[i] * p.w;
+        v = dsv41_bf16x4(v);
+        row[i] = v;
+        sumf += dot(v, v);
+    }
+    sumf = simd_sum(sumf);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) sums[sgitg] = sumf;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sumf = simd_sum(sums[tiisg]);
+
+    const float mean = sumf / (float)args.n_embd;
+    const float norm_scale = 1.0f / sqrt(mean + args.norm_eps);
+    for (uint i = tid; i < n4; i += ntg) {
+        const float4 v = row[i];
+        x_out[i] = v;
+        norm_out[i] = dsv41_bf16x4((v * norm_scale) * norm_weight[i]);
+    }
+}
+
+/* out[h] = bf16(post[h] * block + sum_s comb[h, s] * residual[s]) for the
+ * four streams, kernel_dsv4_hc_expand4's index arithmetic and accumulation
+ * order; copy_pre also carries split[0..3] into `pre` for the next layer. */
+kernel void kernel_dsv41_hc_expand4_bf16(
+        constant ds4_metal_args_dsv41_hc &args,
+        device const float *block_out,
+        device const float *residual,
+        device const float *split,
+        device       float *out,
+        device       float *pre_out,
+        uint d [[thread_position_in_grid]]) {
+    if (d >= args.n_embd) return;
+    device const float *post = split + 4;
+    device const float *comb = split + 8;
+
+    const float block_v = block_out[d];
+    const float r0 = residual[d];
+    const float r1 = residual[d + args.n_embd];
+    const float r2 = residual[d + 2u * args.n_embd];
+    const float r3 = residual[d + 3u * args.n_embd];
+
+    for (uint dst_hc = 0; dst_hc < 4; ++dst_hc) {
+        float acc = block_v * post[dst_hc];
+        acc += comb[dst_hc + 0u * 4u] * r0;
+        acc += comb[dst_hc + 1u * 4u] * r1;
+        acc += comb[dst_hc + 2u * 4u] * r2;
+        acc += comb[dst_hc + 3u * 4u] * r3;
+        out[d + dst_hc * args.n_embd] = dsv41_bf16(acc);
+    }
+    if (args.copy_pre && d < 4) pre_out[d] = split[d];
+}
