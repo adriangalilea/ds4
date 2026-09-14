@@ -129,6 +129,7 @@ def make_blocks(ref, args, weights):
                 module.forward = forward
         attn = block.attn
         attn.window_kv_cache = torch.zeros(1, 128, args.head_dim, dtype=torch.bfloat16)
+        ref.precompute_freqs_cis.cache_clear()
         attn.freqs_cis = ref.precompute_freqs_cis(args.rope_head_dim, args.max_seq_len,
             0, args.rope_theta, args.rope_factor, args.beta_fast, args.beta_slow)
         blocks.append(block)
