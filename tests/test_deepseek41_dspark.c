@@ -68,6 +68,62 @@ typedef struct {
     uint32_t start, count;
 } tap_trace;
 
+typedef struct {
+    ds4_gpu_tensor *value;
+    uint8_t seen[256][40];
+    uint32_t start;
+} route_trace;
+
+static bool capture_routes(void *ud, uint32_t layer, uint32_t pos,
+                            const ds4_gpu_tensor *selected) {
+    route_trace *t = ud;
+    if (pos < t->start || pos - t->start >= 256) return true;
+    if (layer >= 40 || DS4_N_EXPERT_USED != 6) return false;
+    const uint32_t row = pos - t->start;
+    const uint64_t bytes = 6u * sizeof(int32_t);
+    if (!ds4_gpu_tensor_copy(t->value, ((uint64_t)row * 40u + layer) * bytes,
+                             selected, 0, bytes)) return false;
+    t->seen[row][layer] = 1;
+    return true;
+}
+
+static uint64_t weight_bytes(const ds4_tensor *t) { return t ? t->bytes : 0; }
+
+static bool write_route_weights(const char *dir, const ds4_weights *w, uint32_t start) {
+    char path[4096];
+    if (snprintf(path, sizeof(path), "%s/meta.json", dir) >= (int)sizeof(path)) return false;
+    FILE *fp = fopen(path, "w");
+    if (!fp) return false;
+    fprintf(fp, "{\"start\":%u,\"rows\":256,\"layers\":40,\"experts\":384,\"active\":6,\"head_bytes\":%llu,\"embedding_row_bytes\":%llu,\"weights\":[",
+        start, (unsigned long long)(weight_bytes(w->output) + weight_bytes(w->output_norm)),
+        (unsigned long long)(w->token_embd->bytes / DS4_N_VOCAB));
+    for (unsigned il = 0; il < 40; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        const ds4_tensor *always[] = {l->hc_attn_fn, l->hc_attn_scale, l->hc_attn_base,
+            l->attn_norm, l->attn_q_a, l->attn_q_a_norm, l->attn_q_b, l->attn_kv,
+            l->attn_kv_a_norm, l->attn_sinks, l->attn_output_a, l->attn_output_b,
+            l->hc_ffn_fn, l->hc_ffn_scale, l->hc_ffn_base, l->ffn_norm,
+            l->ffn_gate_inp, l->ffn_exp_probs_b, l->ffn_gate_shexp, l->ffn_up_shexp,
+            l->ffn_down_shexp, l->engram_kv, l->engram_q_norm, l->engram_k_norm};
+        uint64_t dense = 0;
+        for (unsigned i = 0; i < sizeof(always) / sizeof(always[0]); i++) dense += weight_bytes(always[i]);
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        const uint64_t publish = ds41_kv_source(il) ? weight_bytes(l->attn_compressor_kv) +
+            (ratio == 2 ? weight_bytes(l->attn_compressor_gate) : 0) : 0;
+        const uint64_t boundary = ds41_kv_source(il) ? weight_bytes(l->attn_compressor_norm) +
+            weight_bytes(l->indexer_attn_k) + weight_bytes(l->indexer_k_norm) : 0;
+        const uint64_t query = ds41_index_source(il) ? weight_bytes(l->indexer_attn_q_b) +
+            weight_bytes(l->indexer_proj) : 0;
+        const uint64_t expert = (l->ffn_gate_exps->bytes + l->ffn_up_exps->bytes +
+                                  l->ffn_down_exps->bytes) / DS4_N_EXPERT;
+        fprintf(fp, "%s{\"layer\":%u,\"expert_bytes\":%llu,\"dense_always\":%llu,\"publish_every\":%llu,\"publish_boundary\":%llu,\"index_query\":%llu,\"ratio\":%u}",
+            il ? "," : "", il, (unsigned long long)expert, (unsigned long long)dense,
+            (unsigned long long)publish, (unsigned long long)boundary, (unsigned long long)query, ratio);
+    }
+    fprintf(fp, "]}\n");
+    return fclose(fp) == 0;
+}
+
 static bool capture_tap(void *ud, uint32_t layer, uint32_t pos, uint32_t kind,
                          const ds4_gpu_tensor *src, uint64_t offset, uint64_t bytes) {
     tap_trace *t = ud;
@@ -124,8 +180,10 @@ static int check_live(const char *target_path, const char *support_path,
     ds41_dspark_graph draft = {0};
     draft_trace trace = {0};
     tap_trace taps = {0};
+    route_trace routes = {0};
     const char *dump_root = getenv("DS4_DSPARK_DUMP_DIR");
     const char *tap_root = getenv("DS4_DSPARK_TAP_DUMP_DIR");
+    const char *route_root = getenv("DS4_DSPARK_ROUTE_DUMP_DIR");
     ds4_gpu_tensor *last = NULL;
     ds4_tokens tokens = {0};
     char *prompt = NULL, err[256] = {0};
@@ -147,6 +205,13 @@ static int check_live(const char *target_path, const char *support_path,
                                           support.size - support.tensor_data_pos, support.max_tensor_bytes));
         CHECK(ds41_dspark_capture_alloc(&session->ds41_graph, &dw));
         CHECK(ds41_dspark_alloc(&draft, &dw));
+        if (route_root) {
+            routes.start = (uint32_t)tokens.len;
+            routes.value = ds4_gpu_tensor_alloc(256u * 40u * 6u * sizeof(int32_t));
+            CHECK(routes.value);
+            session->ds41_graph.dspark_capture->observe_routes = capture_routes;
+            session->ds41_graph.dspark_capture->routes_ud = &routes;
+        }
         if (tap_root) {
             CHECK(tokens.len >= 128);
             taps.start = (uint32_t)tokens.len - 128u;
@@ -227,6 +292,14 @@ static int check_live(const char *target_path, const char *support_path,
     for (uint32_t i = 0; i < 256; i++) fprintf(stderr, "%s%d", i ? "," : "", generated[i]);
     fputc('\n', stderr);
     if (capture) {
+        if (route_root) {
+            /* Capture the final emitted token's routes without emitting another token. */
+            CHECK(ds4_session_eval(session, generated[255], err, sizeof(err)) == 0);
+            for (unsigned row = 0; row < 256; row++)
+                for (unsigned layer = 0; layer < 40; layer++) CHECK(routes.seen[row][layer]);
+            CHECK(write_tensor(route_root, "routes.i32", routes.value, 256u * 40u * 6u * sizeof(int32_t)));
+            CHECK(write_route_weights(route_root, &engine->weights, routes.start));
+        }
         if (tap_root) {
             const char *names[] = {"raw_hc.f32", "mean.f32", "collapsed.f32", "normalized.f32"};
             for (unsigned kind = 0; kind < 4; kind++) {
@@ -275,6 +348,7 @@ done:
     if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
     ds4_gpu_tensor_free(last);
     free_trace(&trace);
+    ds4_gpu_tensor_free(routes.value);
     for (unsigned i = 0; i < 4; i++) ds4_gpu_tensor_free(taps.value[i]);
     ds41_dspark_free(&draft);
     ds4_session_free(session);

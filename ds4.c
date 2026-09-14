@@ -39288,6 +39288,8 @@ typedef struct {
     bool (*observe)(void *, uint32_t, uint32_t, uint32_t,
                     const ds4_gpu_tensor *, uint64_t, uint64_t);
     void *observe_ud;
+    bool (*observe_routes)(void *, uint32_t, uint32_t, const ds4_gpu_tensor *);
+    void *routes_ud;
 } ds41_dspark_capture;
 
 typedef struct {
@@ -40096,6 +40098,9 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             m->map, m->size, bias->abs_offset, 0, 0, token,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
             g->route_logits)) return false;
+    if (g->dspark_capture && g->dspark_capture->observe_routes &&
+        !g->dspark_capture->observe_routes(g->dspark_capture->routes_ud,
+            il, g->pos, g->selected)) return false;
     if (!ds41_stage(il, g->pos, "moe_route")) return false;
     const bool shared_here = !shared_owner || g->tp_rank == (il & 1u);
     bool shared_queued = false;
