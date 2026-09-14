@@ -23,7 +23,7 @@ from deepseek41_quantize import (NativeQuantizer, validate_scales, write_engram,
 from deepseek41_metadata import GGUF_ALIGNMENT, engram_layout, metadata
 import deepseek41_validate_gguf as artifact_audit
 from glm53_quantize import (
-    TensorPlan, QTYPE_F32, QTYPE_I8, QTYPE_IQ2_XXS, QTYPE_Q2_K, QTYPE_Q4_K,
+    SourceDB, TensorPlan, QTYPE_F32, QTYPE_I8, QTYPE_IQ2_XXS, QTYPE_Q2_K, QTYPE_Q4_K,
     align, kv_string, kv_u32, load_tokenizer_records, print_plan, qtype_nbytes,
 )
 
@@ -198,6 +198,33 @@ class ConversionTests(unittest.TestCase):
             validate_scales(db.tensors)
         with self.assertRaisesRegex(ValueError, "overflow"):
             self.q.encode(np.array([[65536]], np.float32), 1)
+
+    def test_dspark_subset_does_not_require_backbone_shards(self):
+        name = "mtp.0.attn_norm.weight"
+        header = json.dumps({name: {"dtype": "BF16", "shape": [2],
+                                   "data_offsets": [0, 4]}}).encode()
+        payload = struct.pack("<HH", 0x3f80, 0x4000)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "draft.safetensors").write_bytes(struct.pack("<Q", len(header)) + header + payload)
+            (root / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {
+                name: "draft.safetensors", "embed.weight": "absent-backbone.safetensors"}}))
+            db = SourceDB(tmp, index_validator=lambda _: None,
+                          scale_validator=lambda _: None, tensor_filter=lambda n: n.startswith("mtp."))
+            try:
+                self.assertEqual(set(db.tensors), {name})
+                self.assertEqual(db.read(name), payload)
+            finally:
+                db.close()
+            with self.assertRaisesRegex(ValueError, "missing source shard"):
+                SourceDB(tmp, index_validator=lambda _: None, scale_validator=lambda _: None)
+
+    def test_dspark_scales_are_validated(self):
+        codes = np.zeros((2, 128), np.uint8)
+        db = MemoryDB(codes, np.zeros((2, 7), np.uint8),
+                      name="mtp.0.ffn.experts.0.w1.weight", dtype="I8")
+        with self.assertRaisesRegex(ValueError, "expected E8M0 scales"):
+            validate_scales(db.tensors, support=True)
 
 
 def official_engram(reference_dir, library_path):

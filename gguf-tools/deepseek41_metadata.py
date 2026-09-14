@@ -85,6 +85,39 @@ def engram_layout(config, tokenizer):
                 primes=primes, multipliers=multipliers)
 
 
+def dspark_metadata(hf_dir, revision):
+    with open(os.path.join(hf_dir, "config.json"), "rb") as fp:
+        config = json.load(fp)
+    if config["model_type"] != "deepseek_v41":
+        raise ValueError("not a DeepSeek V4.1 source checkpoint")
+    c = config["text_config"]
+    taps = c["dspark_target_layer_ids"]
+    if (c["num_nextn_predict_layers"] != 3 or c["dspark_block_size"] != 5 or
+        c["dspark_markov_rank"] != 256 or c["dspark_n_routed_experts"] != 128 or
+        c["dspark_num_experts_per_tok"] != 3 or c["sliding_window"] != 128 or
+        len(taps) != 3 or len(set(taps)) != 3 or
+        any(not 0 <= layer < c["num_hidden_layers"] for layer in taps) or
+        not 0 <= c["dspark_noise_token_id"] < c["vocab_size"]):
+        raise ValueError("unsupported V4.1 DSpark configuration")
+    return config, [
+        kv_string("general.architecture", "deepseek41-dspark"),
+        kv_string("general.name", "DeepSeek V4.1 Flash DSpark support"),
+        kv_string("general.source.url", "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash"),
+        kv_string("general.source.revision", revision),
+        kv_u32("general.alignment", GGUF_ALIGNMENT),
+        kv_string("deepseek41.config", json.dumps(config, sort_keys=True, separators=(",", ":"))),
+        kv_u32("dspark.block_size", c["dspark_block_size"]),
+        kv_u32("dspark.markov_rank", c["dspark_markov_rank"]),
+        kv_u32("dspark.noise_token_id", c["dspark_noise_token_id"]),
+        kv_u32_array("dspark.target_layer_ids", taps),
+        kv_u32("dspark.stage_count", c["num_nextn_predict_layers"]),
+        kv_u32("dspark.n_layers", c["num_nextn_predict_layers"]),
+        kv_u32("dspark.expert_count", c["dspark_n_routed_experts"]),
+        kv_u32("dspark.expert_used_count", c["dspark_num_experts_per_tok"]),
+        kv_u32("dspark.sliding_window", c["sliding_window"]),
+    ]
+
+
 def metadata(hf_dir, revision):
     from tokenizers import Tokenizer
 

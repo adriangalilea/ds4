@@ -208,6 +208,36 @@ This reads only the payloads needed for that tensor.  Add `--compare-gguf
 DeepSeek-V4-Flash-DSpark-support-0731.gguf` to byte-compare against an existing
 support GGUF.
 
+## V4.1 DSpark support
+
+`deepseek41_quantize.py --dspark-support` selects only `mtp.*` from the
+source index. Other shards need not be present. For the original V4.1 Flash
+checkpoint these tensors occupy shards 44–46 of 48 (about 8 GB total).
+Download those shards plus `config.json` and `model.safetensors.index.json`
+at an exact source revision, then run:
+
+```sh
+python3 gguf-tools/deepseek41_quantize.py --hf /path/to/source \
+  --source-revision FULL_SHA --dspark-support --quant q4 \
+  --out DeepSeek-V4.1-Flash-DSpark-support-Q4.gguf --dry-run
+```
+
+Remove `--dry-run` to write the support file; `--resume` continues an
+interrupted conversion. The converter uses the existing V4.1 native FP4/FP8
+decoder and Q4_K/Q8 quantizers, reads one tensor per worker, and shares the
+target's embedding/output instead of duplicating them. The support file has
+three 128-expert blocks, hidden projection, rank-256 Markov weights and F32
+confidence projection. Its `deepseek41-dspark` architecture distinguishes it
+from V4's incompatible drafter. Conversion does not enable V4.1 speculation
+in the runtime.
+
+Validate the artifact with `deepseek41_validate_gguf.py` using the same
+`--hf`, `--source-revision`, `--quant q4`, and `--dspark-support`, plus
+`--gguf FILE --payload`. This checks metadata/layout and re-encodes every
+DSpark tensor, including all routed experts. To check the layout before
+downloading payloads, pass the merged safetensors header JSON to
+`tests/test_deepseek41_dspark_manifest.py --hf-dir DIR --source-headers FILE`.
+
 ## When No Imatrix Is Given
 
 `iq2_xxs` requires an importance vector.  If `--imatrix` is not provided and

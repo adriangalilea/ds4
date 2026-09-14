@@ -18,7 +18,7 @@ import struct
 import sys
 import time
 
-from deepseek41_metadata import GGUF_ALIGNMENT, metadata
+from deepseek41_metadata import GGUF_ALIGNMENT, metadata, dspark_metadata
 from glm53_quantize import (
     SourceDB, TensorPlan, Quantizer, Imatrix, QTYPE_F32, QTYPE_F16,
     QTYPE_Q8_0, QTYPE_Q2_K, QTYPE_Q4_K, QTYPE_IQ2_XXS, QTYPE_I8, align,
@@ -36,9 +36,10 @@ def scale_name(name):
     return name.removesuffix(".weight") + ".scale"
 
 
-def validate_scales(tensors):
+def validate_scales(tensors, support=False):
     for name, info in tensors.items():
-        if not name.startswith(("layers.", "embed.", "head.", "norm.")):
+        prefixes = ("mtp.",) if support else ("layers.", "embed.", "head.", "norm.")
+        if not name.startswith(prefixes):
             continue
         dtype, shape = info["dtype"], info["shape"]
         if dtype not in ("F8_E4M3", "I8") or not name.endswith(".weight"):
@@ -56,7 +57,7 @@ def validate_scales(tensors):
             raise ValueError(f"{name}: expected E8M0 scales {expected}")
 
 
-def build_plan(db, config, quant="q2"):
+def build_plan(db, config, quant="q2", support=False):
     if quant not in QUANTIZATION:
         raise ValueError(f"unknown quantization recipe: {quant}")
     c = config["text_config"]
@@ -66,6 +67,10 @@ def build_plan(db, config, quant="q2"):
     heads, hd = c["num_attention_heads"], c["head_dim"]
     qrank, orank, groups = c["q_lora_rank"], c["o_lora_rank"], c["o_groups"]
     hc, experts, vocab = c["hc_mult"], c["n_routed_experts"], c["vocab_size"]
+    layers = c["num_hidden_layers"]
+    if support:
+        layers = c["num_nextn_predict_layers"]
+        experts = c["dspark_n_routed_experts"]
     ih, idim = c["index_n_heads"], c["index_head_dim"]
     plan, disk, consumed = [], [], set()
 
@@ -82,11 +87,13 @@ def build_plan(db, config, quant="q2"):
         claim(source, shape)
         plan.append(TensorPlan(name, tuple(reversed(shape)), qtype, role, source=source))
 
-    regular("token_embd.weight", "embed.weight", (vocab, dim), QTYPE_F16, "embedding")
-    regular("output_norm.weight", "norm.weight", (dim,), QTYPE_F32, "norm")
-    regular("output.weight", "head.weight", (vocab, dim), QTYPE_Q8_0, "output")
-    for layer in range(c["num_hidden_layers"]):
-        src, dst = f"layers.{layer}", f"blk.{layer}"
+    if not support:
+        regular("token_embd.weight", "embed.weight", (vocab, dim), QTYPE_F16, "embedding")
+        regular("output_norm.weight", "norm.weight", (dim,), QTYPE_F32, "norm")
+        regular("output.weight", "head.weight", (vocab, dim), QTYPE_Q8_0, "output")
+    for layer in range(layers):
+        src = f"mtp.{layer}" if support else f"layers.{layer}"
+        dst = f"mtp.{layer}" if support else f"blk.{layer}"
         for site in ("attn", "ffn"):
             for part, shape, qt in (("fn", (hc * (hc + 2), hc * dim), QTYPE_F16),
                                     ("base", (hc * (hc + 2),), QTYPE_F32),
@@ -104,7 +111,7 @@ def build_plan(db, config, quant="q2"):
             ("attn_output_b.weight", "wo_b.weight", (dim, groups * orank), QTYPE_Q8_0),
         ):
             regular(f"{dst}.{target}", f"{src}.attn.{source}", shape, qt, "attention")
-        if layer in c["kv_source_layer_ids"]:
+        if not support and layer in c["kv_source_layer_ids"]:
             for target, source, shape, qt in (
                 ("attn_compressor_kv.weight", "compressor.wkv.weight", (hd, dim), QTYPE_F16),
                 ("attn_compressor_norm.weight", "compressor.norm.weight", (hd,), QTYPE_F32),
@@ -115,7 +122,7 @@ def build_plan(db, config, quant="q2"):
             if c["compress_ratios"][layer] > 1:
                 regular(f"{dst}.attn_compressor_gate.weight", f"{src}.attn.compressor.wgate.weight",
                         (hd, dim), QTYPE_F16, "compressor")
-        if layer in c["index_source_layer_ids"]:
+        if not support and layer in c["index_source_layer_ids"]:
             regular(f"{dst}.indexer.attn_q_b.weight", f"{src}.attn.indexer.wq_b.weight",
                     (ih * idim, qrank), QTYPE_F16, "indexer")
             regular(f"{dst}.indexer.proj.weight", f"{src}.attn.indexer.weights_proj.weight",
@@ -135,7 +142,7 @@ def build_plan(db, config, quant="q2"):
                                    QTYPE_Q4_K if quant == "q4" else qt,
                                    "experts", source=pattern, expert_layer=layer,
                                    expert_part=part, expert_count=experts))
-        if layer in c["engram_layer_ids"]:
+        if not support and layer in c["engram_layer_ids"]:
             index = c["engram_layer_ids"].index(layer)
             rows = c["engram_num_embeddings"][index]
             engram = f"{src}.engram"
@@ -146,7 +153,22 @@ def build_plan(db, config, quant="q2"):
             for part in ("q", "k"):
                 regular(f"{dst}.engram_{part}_norm.weight", f"{engram}.{part}_weight", (hc, dim), QTYPE_F32, "engram")
             regular(f"{dst}.engram_kv.weight", f"{engram}.wkv.weight", ((hc + 1) * dim, 24 * 256), QTYPE_F16, "engram")
-    omitted = {name for name in db.tensors if name.startswith(("mtp.", "vision.", "aligner.", "image_"))}
+    if support:
+        regular("mtp.0.main_proj.weight", "mtp.0.main_proj.weight",
+                (dim, dim * len(c["dspark_target_layer_ids"])), QTYPE_Q8_0, "projection")
+        regular("mtp.0.main_norm.weight", "mtp.0.main_norm.weight", (dim,), QTYPE_F32, "norm")
+        final = f"mtp.{layers - 1}"
+        regular(f"{final}.norm.weight", f"{final}.norm.weight", (dim,), QTYPE_F32, "norm")
+        # Keep V4's support tensor names; V4.1 calls these embed and head.
+        for source, target, qt in (("embed", "markov_w1", QTYPE_F16),
+                                   ("head", "markov_w2", QTYPE_Q8_0)):
+            regular(f"{final}.markov_head.{target}.weight", f"{final}.markov_head.{source}.weight",
+                    (vocab, c["dspark_markov_rank"]), qt, "markov")
+        regular(f"{final}.confidence_head.proj.weight", f"{final}.confidence_head.proj.weight",
+                (1, dim + c["dspark_markov_rank"]), QTYPE_F32, "confidence")
+        omitted = {name for name in db.tensors if not name.startswith("mtp.")}
+    else:
+        omitted = {name for name in db.tensors if name.startswith(("mtp.", "vision.", "aligner.", "image_"))}
     if consumed | omitted != set(db.tensors):
         raise ValueError(f"unclaimed source tensors: {sorted(set(db.tensors) - consumed - omitted)[:10]}")
     offset = 0
@@ -303,6 +325,8 @@ def main():
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--dspark-support", action="store_true",
+                        help="convert only mtp.*; shared embedding/output come from the target")
     suffix = "dylib" if sys.platform == "darwin" else "so"
     parser.add_argument("--quants-library", default=os.path.join(os.path.dirname(__file__), f"libds4quants.{suffix}"))
     args = parser.parse_args()
@@ -310,10 +334,12 @@ def main():
         parser.error("source revision must be a full commit hash")
     if not 1 <= args.threads <= 32:
         parser.error("threads must be between 1 and 32")
-    config, records = metadata(args.hf, args.source_revision)
-    db = SourceDB(args.hf, index_validator=lambda _: None, scale_validator=validate_scales)
+    config, records = (dspark_metadata if args.dspark_support else metadata)(args.hf, args.source_revision)
+    db = SourceDB(args.hf, index_validator=lambda _: None,
+                  scale_validator=lambda tensors: validate_scales(tensors, args.dspark_support),
+                  tensor_filter=(lambda name: name.startswith("mtp.")) if args.dspark_support else None)
     try:
-        plan = build_plan(db, config, args.quant)
+        plan = build_plan(db, config, args.quant, args.dspark_support)
         records.append(kv_string("deepseek41.quantization", QUANTIZATION[args.quant]))
         records.append(kv_string("deepseek41.calibration", "imatrix" if args.imatrix else "weight-energy bootstrap"))
         if args.imatrix:

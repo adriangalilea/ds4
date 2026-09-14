@@ -34,7 +34,8 @@ def check_payload(fp, offset, item, db, quantizer, imatrix):
             if read_exact(fp, 264, item.name) != expected:
                 raise ValueError(f"{item.name}: Engram row {row} differs from source")
     elif item.is_expert:
-        selected = {0, (item.expert_layer * 17 + 41) % item.expert_count, item.expert_count - 1}
+        selected = (range(item.expert_count) if item.name.startswith("mtp.") else
+                    {0, (item.expert_layer * 17 + 41) % item.expert_count, item.expert_count - 1})
         stride = item.nbytes // item.expert_count
         for expert in sorted(selected):
             values = quantizer.to_f32(db, item.source.format(expert=expert))
@@ -53,9 +54,29 @@ def check_payload(fp, offset, item, db, quantizer, imatrix):
 
 def validate(args):
     config = json.loads((Path(args.hf) / "config.json").read_text())
-    db = SourceDB(args.hf, index_validator=lambda _: None, scale_validator=validate_scales)
+    support = getattr(args, "dspark_support", False)
+    db = SourceDB(args.hf, index_validator=lambda _: None,
+                  scale_validator=lambda tensors: validate_scales(tensors, support),
+                  tensor_filter=(lambda name: name.startswith("mtp.")) if support else None)
     try:
-        plan = build_plan(db, config, args.quant)
+        plan = build_plan(db, config, args.quant, support)
+        expected = {"general.architecture": "deepseek41-dspark" if support else "deepseek41",
+                    "general.alignment": GGUF_ALIGNMENT,
+                    "general.source.revision": args.source_revision,
+                    "deepseek41.quantization": QUANTIZATION[args.quant],
+                    "deepseek41.calibration": "imatrix" if args.imatrix else "weight-energy bootstrap"}
+        if support:
+            c = config["text_config"]
+            expected.update({"deepseek41.config": json.dumps(config, sort_keys=True, separators=(",", ":")),
+                "dspark.block_size": c["dspark_block_size"],
+                "dspark.markov_rank": c["dspark_markov_rank"],
+                "dspark.noise_token_id": c["dspark_noise_token_id"],
+                "dspark.target_layer_ids": c["dspark_target_layer_ids"],
+                "dspark.stage_count": c["num_nextn_predict_layers"],
+                "dspark.n_layers": c["num_nextn_predict_layers"],
+                "dspark.expert_count": c["dspark_n_routed_experts"],
+                "dspark.expert_used_count": c["dspark_num_experts_per_tok"],
+                "dspark.sliding_window": c["sliding_window"]})
         with open(args.gguf, "rb") as fp:
             if read_exact(fp, 4, "magic") != b"GGUF" or read_u32(fp, "version") != 3:
                 raise ValueError("expected GGUF v3")
@@ -65,17 +86,12 @@ def validate(args):
             for _ in range(read_u64(fp, "metadata count")):
                 key = read_gguf_string(fp, "metadata key")
                 kind = read_u32(fp, "metadata type")
-                if key in {"general.architecture", "general.alignment", "general.source.revision",
-                            "deepseek41.calibration", "deepseek41.quantization"}:
+                if key in expected:
                     if key in metadata:
                         raise ValueError(f"duplicate metadata: {key}")
                     metadata[key] = read_selected_metadata(fp, kind)
                 else:
                     skip_gguf_value(fp, kind)
-            expected = {"general.architecture": "deepseek41", "general.alignment": GGUF_ALIGNMENT,
-                        "general.source.revision": args.source_revision,
-                        "deepseek41.quantization": QUANTIZATION[args.quant],
-                        "deepseek41.calibration": "imatrix" if args.imatrix else "weight-energy bootstrap"}
             if metadata != expected:
                 raise ValueError(f"metadata mismatch: {metadata}")
             for item in plan:
@@ -113,6 +129,7 @@ if __name__ == "__main__":
     parser.add_argument("--quant", choices=QUANTIZATION, default="q2")
     parser.add_argument("--imatrix")
     parser.add_argument("--payload", action="store_true")
+    parser.add_argument("--dspark-support", action="store_true")
     suffix = "dylib" if sys.platform == "darwin" else "so"
     parser.add_argument("--quants-library", default=str(Path(__file__).with_name(f"libds4quants.{suffix}")))
     args = parser.parse_args()
