@@ -7831,7 +7831,7 @@ static void dspark_bind_block(
     l->ffn_gate_inp    = dspark_bind_tensor(dw, m, stage, "ffn_gate_inp.weight", true);
     l->ffn_exp_probs_b = dspark_bind_tensor(dw, m, stage, "exp_probs_b.bias", true);
     if (dw->v41)
-        l->ffn_exp_probs_vl = dspark_bind_tensor(dw, m, stage, "exp_probs_vl.bias", true);
+        l->ffn_exp_probs_vl = dspark_bind_tensor(dw, m, stage, "exp_probs_b_vl.bias", true);
     l->ffn_gate_exps   = dspark_bind_tensor(dw, m, stage, "ffn_gate_exps.weight", true);
     l->ffn_up_exps     = dspark_bind_tensor(dw, m, stage, "ffn_up_exps.weight", true);
     l->ffn_down_exps   = dspark_bind_tensor(dw, m, stage, "ffn_down_exps.weight", true);

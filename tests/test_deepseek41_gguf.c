@@ -145,6 +145,8 @@ static void check_dspark_layout(const char *path) {
     assert(stages == 3);
     ds4_dspark_weights dw;
     dspark_weights_bind_optional(&dw, &m, &summary);
+    fprintf(stderr, "V4.1 DSpark binding: present=%u missing=%u invalid=%u metadata_errors=%u\n",
+            dw.present_tensors, dw.missing_tensors, dw.invalid_tensors, dw.metadata_errors);
     assert(dw.v41 && dw.present_tensors == 81);
     assert(!dw.missing_tensors && !dw.invalid_tensors && !dw.metadata_errors);
     assert(dw.n_expert == 128 && dw.n_expert_used == 3 && dw.sliding_window == 128);
