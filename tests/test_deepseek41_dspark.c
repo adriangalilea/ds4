@@ -29,6 +29,10 @@ int main(int argc, char **argv) {
     CHECK(dw.v41 && !dw.missing_tensors && !dw.invalid_tensors && !dw.metadata_errors);
     ds4_gpu_model_residency_skip(1);
     CHECK(ds4_gpu_init());
+    const uint64_t target_offsets[] = {weights.token_embd->abs_offset, weights.output->abs_offset};
+    const uint64_t target_sizes[] = {weights.token_embd->bytes, weights.output->bytes};
+    CHECK(ds4_gpu_set_model_map_spans(target.map, target.size, target_offsets, target_sizes, 2,
+        target_sizes[0] > target_sizes[1] ? target_sizes[0] : target_sizes[1]));
     CHECK(ds4_gpu_set_model_map_range(support.map, support.size, support.tensor_data_pos,
                                       support.size - support.tensor_data_pos, support.max_tensor_bytes));
     CHECK(ds41_dspark_alloc(&draft, &dw));

@@ -65,6 +65,7 @@
 /tests/test_cuda_ssd_repack
 /tests/test_deepseek41_gguf
 /tests/test_deepseek41_graph
+/tests/test_deepseek41_dspark
 /tests/test_deepseek41_prefill
 /tests/test_deepseek41_cli
 /tests/test_engram
