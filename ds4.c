@@ -40461,8 +40461,15 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
      * layer mapped, using the same admitted reserve as layer-major prefill. */
     const bool layer_resident = g->streaming && g->quality;
     if (layer_resident && !ds4_gpu_end_commands()) ok = false;
-    const bool queue_layers = g->tp_world == 2 && !g->imatrix &&
-        !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE");
+    /* The token's command buffers stay queued and drain only where the graph
+     * needs it (layer 13, the last layer).  Draining after every one of the
+     * 40 layers instead costs 40 CPU<->GPU round trips per token: measured
+     * 16.9 -> 21.7 t/s on an M3 Ultra with the Q4 model resident, greedy
+     * output byte-identical.  DS4_METAL_DISABLE_V41_DECODE_QUEUE restores
+     * the per-layer drain on a single box. */
+    const bool queue_layers = !g->imatrix &&
+        !getenv(g->tp_world == 2 ? "DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE"
+                                 : "DS4_METAL_DISABLE_V41_DECODE_QUEUE");
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (layer_resident)
@@ -40483,6 +40490,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
          * 14, and before publishing the completed token to the CPU. */
         const bool drain = !queue_layers || il == 13 || il + 1u == DS4_N_LAYER;
         if (drain && !ds4_gpu_end_commands()) ok = false;
+        /* Commit the queued layer without waiting so the GPU starts it while
+         * the CPU encodes the next one: 21.6 -> 23.1 t/s on top of the queue
+         * (M3 Ultra, Q4 resident, greedy output byte-identical).
+         * DS4_METAL_DISABLE_V41_DECODE_FLUSH keeps the token in one buffer
+         * between drains. */
+        if (ok && !drain && queue_layers && !layer_resident &&
+            !getenv("DS4_METAL_DISABLE_V41_DECODE_FLUSH") && !ds4_gpu_flush_commands()) ok = false;
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
         if (ok && g->imatrix)
             ok = imatrix_collect_tensor_batch(g->imatrix, g->norm, g->mid,
