@@ -58,25 +58,33 @@ static int check_live(const char *target_path, const char *support_path,
     int rc = 1;
     ds4_engine *engine = NULL;
     ds4_session *session = NULL;
+    ds4_model support = {.fd = -1};
+    ds4_dspark_weights dw = {0};
     ds41_dspark_graph draft = {0};
     ds4_gpu_tensor *last = NULL;
     ds4_tokens tokens = {0};
     char *prompt = NULL, err[256] = {0};
     size_t prompt_bytes = 0;
-    ds4_engine_options opt = {.model_path = target_path, .mtp_path = support_path,
-        .backend = DS4_BACKEND_METAL, .context_size = 32768, .power_percent = 100,
-        .dspark = true};
+    ds4_engine_options opt = {.model_path = target_path,
+        .backend = DS4_BACKEND_METAL, .context_size = 32768, .power_percent = 100};
     CHECK(imatrix_read_text_file(prompt_path, &prompt, &prompt_bytes));
     CHECK(prompt_bytes && ds4_engine_open(&engine, &opt) == 0);
     ds4_encode_chat_prompt(engine, NULL, prompt, DS4_THINK_NONE, &tokens);
     CHECK(tokens.len > 1 && tokens.len + 256 < 32768);
     CHECK(ds4_session_create(&session, engine, 32768) == 0);
     if (capture) {
-        CHECK(ds41_dspark_capture_alloc(&session->ds41_graph, &engine->dspark_weights));
-        CHECK(ds41_dspark_alloc(&draft, &engine->dspark_weights));
+        model_open(&support, support_path, true, false);
+        CHECK(support_model_checkpoint_compatible(&support));
+        const ds4_dspark_summary summary = model_dspark_summary(&support);
+        dspark_weights_bind_optional(&dw, &support, &summary);
+        CHECK(dw.v41 && !dw.missing_tensors && !dw.invalid_tensors && !dw.metadata_errors);
+        CHECK(ds4_gpu_set_model_map_range(support.map, support.size, support.tensor_data_pos,
+                                          support.size - support.tensor_data_pos, support.max_tensor_bytes));
+        CHECK(ds41_dspark_capture_alloc(&session->ds41_graph, &dw));
+        CHECK(ds41_dspark_alloc(&draft, &dw));
     }
     CHECK(ds4_session_sync(session, &tokens, err, sizeof(err)) == 0);
-    if (capture) CHECK(ds41_dspark_seed_capture(&draft, &engine->mtp_model,
+    if (capture) CHECK(ds41_dspark_seed_capture(&draft, &support,
                                                 session->ds41_graph.dspark_capture, (uint32_t)tokens.len));
     int generated[256];
     int32_t proposals[256][16] = {{0}};
@@ -99,7 +107,7 @@ static int check_live(const char *target_path, const char *support_path,
             last = ds4_gpu_tensor_view(c->hidden, (pos % 128u) * bytes, bytes);
             CHECK(last);
             const double t0 = now_sec();
-            CHECK(ds41_dspark_forward(&draft, &engine->model, &engine->weights, &engine->mtp_model,
+            CHECK(ds41_dspark_forward(&draft, &engine->model, &engine->weights, &support,
                                         last, pos, token, proposals[i], confidence[i]));
             draft_ms += (now_sec() - t0) * 1000;
             ds4_gpu_tensor_free(last); last = NULL;
@@ -148,6 +156,7 @@ done:
     ds41_dspark_free(&draft);
     ds4_session_free(session);
     ds4_engine_close(engine);
+    if (support.map) model_close(&support);
     ds4_tokens_free(&tokens);
     free(prompt);
     return rc;
