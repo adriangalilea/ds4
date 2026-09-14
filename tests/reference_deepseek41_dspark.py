@@ -6,6 +6,7 @@ semantic oracle, not a bit-exact replica of Metal reduction trees. Experts
 are materialized on demand so the three blocks fit a 24-GiB development Mac.
 """
 import argparse
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -103,6 +104,10 @@ class Weights:
         source = self.q.to_f32(self.db, name, row_start, row_count)
         qt = self.types[name]
         encoded = self.q.encode(source, qt)
+        if name == "head.weight":
+            if row_start == 0:
+                self.head_hash = hashlib.sha256()
+            self.head_hash.update(encoded)
         if qt == 0:
             values = np.frombuffer(encoded, dtype="<f4").copy()
         elif qt == 1:
@@ -176,6 +181,7 @@ def main():
     parser.add_argument("--hf", type=Path, required=True)
     parser.add_argument("--dump", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--head-sha256", help="expected hash of the target GGUF Q8 head payload")
     opts = parser.parse_args()
     torch.set_num_threads(8)
     torch.set_default_dtype(torch.bfloat16)
@@ -217,6 +223,10 @@ def main():
         compare(folder, "2-collapsed", collapsed, reports)
         base = read(folder / "base_logits.f32", (1, 5, args.vocab_size))
         reference_base = blocks[-1].head(blocks[-1].norm(collapsed), full_logits=True)
+        head_hash = weights.head_hash.hexdigest()
+        if opts.head_sha256:
+            assert head_hash == opts.head_sha256, (head_hash, opts.head_sha256)
+        print(json.dumps(dict(target_head_sha256=head_hash)), flush=True)
         compare(folder, "base_logits", reference_base, reports)
         previous = torch.tensor([meta["seed"]])
         proposed, embeds = [], []
@@ -237,7 +247,9 @@ def main():
             complete.append(previous.item())
         print(json.dumps(dict(position=pos, reference_proposals=complete,
             exact_proposals=complete == meta["proposals"])), flush=True)
-        all_reports[folder.name] = reports
+        all_reports[folder.name] = dict(intermediates=reports, reference_proposals=complete,
+            metal_proposals=meta["proposals"], exact_proposals=complete == meta["proposals"],
+            target_head_sha256=head_hash)
     opts.output.write_text(json.dumps(all_reports, indent=2) + "\n")
 
 
