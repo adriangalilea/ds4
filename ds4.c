@@ -39766,6 +39766,15 @@ static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
         ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm);
 }
 
+/* DS4_METAL_GPU_STAGE_TIMESTAMPS splits the token's command stream at these
+ * boundaries so ds4_gpu_stage_report attributes GPU busy time per stage
+ * (part "v41"; a tag names the work emitted since the previous boundary).
+ * Off, the layer is one uninterrupted stream. */
+static bool ds41_stage(uint32_t il, uint32_t pos, const char *stage) {
+    if (!metal_graph_gpu_stage_timestamps_layer(il)) return true;
+    return ds4_gpu_stage_flush("v41", stage, il, pos, 1) != 0;
+}
+
 static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, bool projected) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
@@ -39773,16 +39782,20 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
     const uint32_t heads = DS4_N_HEAD / g->tp_world;
     const uint32_t head0 = g->tp_rank * heads;
-    if (!projected && !ds41_attention_project(g, m, l)) return false;
+    if (!projected && (!ds41_attention_project(g, m, l) ||
+                       !ds41_stage(il, pos, "attn_project"))) return false;
     if (!ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) ||
         !ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, pos, false) ||
         !ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0) ||
         !ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
                              g->kv, 0, 512u * 4u) ||
-        !ds41_attention_select(g, m, l, il)) return false;
+        !ds41_stage(il, pos, "attn_kv") ||
+        !ds41_attention_select(g, m, l, il) ||
+        !ds41_stage(il, pos, "attn_select")) return false;
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
-    if (n_comp && !ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
-                                         g->selected_comp, n_comp, attended)) return false;
+    if (n_comp && (!ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
+                                          g->selected_comp, n_comp, attended) ||
+                   !ds41_stage(il, pos, "attn_gather"))) return false;
     const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
     if (!ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size,
             l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float),
@@ -39790,11 +39803,13 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
             g->selected_kv, 0, attended, NULL, 0,
             heads, DS4_N_HEAD_DIM) ||
         !ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
-        !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)) return false;
+        !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true) ||
+        !ds41_stage(il, pos, "attn_heads")) return false;
     if (projected) return true;
     return ds41_attention_output(g, m, l) &&
            ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
-           ds41_bf16(g->block, DS4_N_EMBD);
+           ds41_bf16(g->block, DS4_N_EMBD) &&
+           ds41_stage(il, pos, "attn_out");
 }
 
 static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
@@ -39811,7 +39826,8 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         !ds4_gpu_router_select_tensor(g->selected, g->route_weights, g->route_probs,
             m->map, m->size, bias->abs_offset, 0, 0, token,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
-            g->route_logits)) return false;
+            g->route_logits) ||
+        !ds41_stage(il, g->pos, "moe_route")) return false;
     const bool shared_here = !shared_owner || g->tp_rank == (il & 1u);
     bool shared_queued = false;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -39834,7 +39850,8 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         !ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
                               DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) ||
         !ds41_bf16(g->shared_mid, DS4_N_FF_EXP) ||
-        !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true))) return false;
+        !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true) ||
+        !ds41_stage(il, g->pos, "moe_shared"))) return false;
     bool routed_ok;
 #ifndef __APPLE__
     if (g->tp_world == 2) {
@@ -39857,7 +39874,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (shared_queued && !ds4_gpu_dsv41_shared_join()) return false;
 #endif
-    if (!routed_ok) return false;
+    if (!routed_ok || !ds41_stage(il, g->pos, "moe_routed")) return false;
     /* Keep the shared expert's BF16 boundary, then include it exactly once
      * in the existing F32 reduction. Alternate ownership across layers. */
     if (shared_owner && g->tp_rank == (il & 1u) &&
@@ -40198,15 +40215,6 @@ static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
         ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float));
 }
 
-/* DS4_METAL_GPU_STAGE_TIMESTAMPS splits the token's command stream at these
- * boundaries so ds4_gpu_stage_report attributes GPU busy time per stage
- * (part "v41"; a tag names the work emitted since the previous boundary).
- * Off, the layer is one uninterrupted stream. */
-static bool ds41_stage(uint32_t il, uint32_t pos, const char *stage) {
-    if (!metal_graph_gpu_stage_timestamps_layer(il)) return true;
-    return ds4_gpu_stage_flush("v41", stage, il, pos, 1) != 0;
-}
-
 static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
                             const ds4_layer_weights *l, uint32_t il, int token) {
     return ds41_stage(il, g->pos, "before") &&
@@ -40350,13 +40358,15 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
      * layer mapped, using the same admitted reserve as layer-major prefill. */
     const bool layer_resident = g->streaming && g->quality;
     if (layer_resident && !ds4_gpu_end_commands()) ok = false;
-    /* Single-box Metal drains (commit + wait) after every layer by default:
-     * 40 CPU<->GPU round trips per token.  DS4_METAL_V41_DECODE_QUEUE keeps
-     * the token's command buffers queued like the TP path and drains only
-     * where the graph needs it (layer 13, the last layer). */
+    /* The token's command buffers stay queued and drain only where the graph
+     * needs it (layer 13, the last layer).  Draining after every one of the
+     * 40 layers instead costs 40 CPU<->GPU round trips per token: measured
+     * 16.9 -> 21.7 t/s on an M3 Ultra with the Q4 model, greedy output
+     * byte-identical.  DS4_METAL_DISABLE_V41_DECODE_QUEUE restores the
+     * per-layer drain on a single box. */
     const bool queue_layers = !g->imatrix &&
-        (g->tp_world == 2 ? !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE")
-                          : getenv("DS4_METAL_V41_DECODE_QUEUE") != NULL);
+        !getenv(g->tp_world == 2 ? "DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE"
+                                 : "DS4_METAL_DISABLE_V41_DECODE_QUEUE");
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (layer_resident)
