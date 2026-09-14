@@ -39374,6 +39374,21 @@ static bool ds41_dspark_capture_valid(const ds41_dspark_capture *c, uint32_t sta
     return true;
 }
 
+static bool ds41_dspark_capture_pack(ds4_gpu_tensor *out,
+                                      const ds41_dspark_capture *c, uint32_t end) {
+    const uint32_t count = end < 128u ? end : 128u, start = end - count;
+    if (!ds41_dspark_capture_valid(c, start, count)) return false;
+    const uint64_t bytes = (uint64_t)3 * DS4_N_EMBD * sizeof(float);
+    const uint32_t first = start % 128u;
+    const uint32_t tail = count < 128u - first ? count : 128u - first;
+    bool ok = ds4_gpu_begin_commands() &&
+        ds4_gpu_tensor_copy(out, 0, c->hidden, first * bytes, tail * bytes) &&
+        (tail == count || ds4_gpu_tensor_copy(out, tail * bytes, c->hidden, 0,
+                                               (count - tail) * bytes));
+    if (!ds4_gpu_end_commands()) ok = false;
+    return ok;
+}
+
 static bool ds41_read_array(const ds4_model *m, const char *key, uint32_t type,
                             uint64_t count, void *out, size_t bytes) {
     ds4_array_ref arr;
@@ -40776,13 +40791,7 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_seed(ds41_dspark_graph *d, const ds4_mo
 static DS4_MAYBE_UNUSED bool ds41_dspark_seed_capture(ds41_dspark_graph *d,
                      const ds4_model *m, const ds41_dspark_capture *c, uint32_t end) {
     const uint32_t count = end < 128u ? end : 128u, start = end - count;
-    if (!ds41_dspark_capture_valid(c, start, count)) return false;
-    const uint64_t bytes = (uint64_t)3 * DS4_N_EMBD * sizeof(float);
-    const uint32_t first = start % 128u;
-    const uint32_t tail = count < 128u - first ? count : 128u - first;
-    if (!ds4_gpu_tensor_copy(d->main_input, 0, c->hidden, first * bytes, tail * bytes) ||
-        (tail < count && !ds4_gpu_tensor_copy(d->main_input, tail * bytes, c->hidden, 0,
-                                               (count - tail) * bytes))) return false;
+    if (!ds41_dspark_capture_pack(d->main_input, c, end)) return false;
     return ds41_dspark_seed(d, m, d->main_input, start, count);
 }
 

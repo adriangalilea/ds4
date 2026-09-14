@@ -12,7 +12,7 @@ static int check_capture(void) {
     ds4_dspark_weights dw = {.v41 = true, .target_layer_count = 3,
         .sliding_window = 128, .target_layers = {37, 38, 39}};
     ds41_gpu_graph g = {0};
-    ds4_gpu_tensor *residual = NULL;
+    ds4_gpu_tensor *residual = NULL, *packed = NULL;
     float *x = NULL;
     CHECK(ds4_gpu_init());
     CHECK(ds41_dspark_capture_alloc(&g, &dw));
@@ -32,6 +32,9 @@ static int check_capture(void) {
     }
     CHECK(ds41_dspark_capture_valid(g.dspark_capture, 122, 128));
     CHECK(!ds41_dspark_capture_valid(g.dspark_capture, 121, 128));
+    packed = ds4_gpu_tensor_alloc((uint64_t)128 * 3 * DS4_N_EMBD * sizeof(float));
+    CHECK(packed && ds41_dspark_capture_pack(packed, g.dspark_capture, 250));
+    CHECK(!ds4_gpu_commands_active());
     float hidden[5120];
     for (uint32_t pos = 122; pos < 250; pos++)
         for (uint32_t tap = 0; tap < 3; tap++) {
@@ -39,14 +42,20 @@ static int check_capture(void) {
                 ((uint64_t)(pos % 128u) * 3u + tap) * sizeof(hidden), hidden, sizeof(hidden)));
             for (uint32_t col = 0; col < DS4_N_EMBD; col++)
                 CHECK(hidden[col] == tap * 32 + (pos - 100) % 17 + col % 11 + 1.5f);
+            CHECK(ds4_gpu_tensor_read(packed,
+                ((uint64_t)(pos - 122) * 3u + tap) * sizeof(hidden), hidden, sizeof(hidden)));
+            for (uint32_t col = 0; col < DS4_N_EMBD; col++)
+                CHECK(hidden[col] == tap * 32 + (pos - 100) % 17 + col % 11 + 1.5f);
         }
     ds41_graph_reset(&g);
     CHECK(!ds41_dspark_capture_valid(g.dspark_capture, 122, 128));
-    puts("V4.1 DSpark HC means, concatenation, ring truncation and reset: PASS");
+    CHECK(!ds41_dspark_capture_pack(packed, g.dspark_capture, 250));
+    puts("V4.1 DSpark HC means, concatenation, ring packing and reset: PASS");
     rc = 0;
 done:
     if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
     ds4_gpu_tensor_free(residual);
+    ds4_gpu_tensor_free(packed);
     ds41_dspark_capture_free(g.dspark_capture);
     ds4_gpu_cleanup();
     free(x);
