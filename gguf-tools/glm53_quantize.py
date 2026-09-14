@@ -375,6 +375,17 @@ class SourceDB:
             os.close(fd)
         self._fds.clear()
 
+    def shard_bytes(self, shard):
+        return os.path.getsize(os.path.join(self.hf_dir, shard))
+
+    def release_shard(self, shard):
+        """Close and delete a shard whose every tensor has been written and verified."""
+        with self._fd_lock:
+            fd = self._fds.pop(shard, None)
+            if fd is not None:
+                os.close(fd)
+        os.unlink(os.path.join(self.hf_dir, shard))
+
 
 def source_prefix(layer):
     return f"{LAYER_PREFIX}.{layer}"

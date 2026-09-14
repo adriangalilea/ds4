@@ -9,11 +9,13 @@ separate models and are not part of this text GGUF.
 """
 
 import argparse
+import collections
 import concurrent.futures
 import dataclasses
 import hashlib
 import json
 import os
+import random
 import re
 import shutil
 import struct
@@ -25,7 +27,7 @@ from glm53_quantize import (
     SourceDB, TensorPlan, Quantizer, Imatrix, QTYPE_F32, QTYPE_F16,
     QTYPE_Q8_0, QTYPE_Q2_K, QTYPE_Q4_K, QTYPE_IQ2_XXS, QTYPE_I8, QTYPE_MXFP4,
     align, conversion_signature, kv_string, load_resume_state, print_plan,
-    qtype_nbytes, save_resume_state, tensor_header,
+    qtype_nbytes, read_exact, save_resume_state, tensor_header,
 )
 
 QUANTIZATION = {
@@ -263,6 +265,58 @@ class NativeQuantizer(Quantizer):
         return self.encode(self.to_f32(db, name), qtype, imatrix)
 
 
+def item_sources(item):
+    if item.is_expert:
+        return [item.source.format(expert=expert) for expert in range(item.expert_count)]
+    return [item.source]
+
+
+def item_shards(db, item):
+    shards = set()
+    for name in item_sources(item):
+        shards.add(db.info(name)["shard"])
+        if db.info(name)["dtype"] in ("I8", "F8_E4M3"):
+            shards.add(db.info(scale_name(name))["shard"])
+    return shards
+
+
+def check_payload(fp, offset, item, db, quantizer, imatrix):
+    """Compare a written tensor with a fresh encode of its source.
+
+    Experts of the target sample three per tensor; the support model and every
+    dense tensor are checked whole. Engram rows are sampled: the table is a
+    raw copy and a full re-read would double the largest I/O of the conversion."""
+    if item.role == "engram_disk":
+        rows = item.shape[1]
+        rng = random.Random(41 + rows)
+        selected = {0, 1, rows - 1, 16383, 16384, (1 << 32) // 264}
+        selected.update(rng.randrange(rows) for _ in range(128))
+        for row in sorted(selected):
+            if row >= rows:
+                continue
+            expected = b"".join(db.iter_read(item.source, row * 256, 256))
+            expected += b"".join(db.iter_read(scale_name(item.source), row * 8, 8))
+            fp.seek(offset + row * 264)
+            if read_exact(fp, 264, item.name) != expected:
+                raise ValueError(f"{item.name}: Engram row {row} differs from source")
+    elif item.is_expert:
+        selected = (range(item.expert_count) if item.name.startswith("mtp.") else
+                    {0, (item.expert_layer * 17 + 41) % item.expert_count, item.expert_count - 1})
+        stride = item.nbytes // item.expert_count
+        for expert in sorted(selected):
+            importance = imatrix.expert(item.name, expert, item.shape[0], item.expert_count)
+            expected = quantizer.encode_expert(db, item.source.format(expert=expert), item.qtype, importance)
+            fp.seek(offset + expert * stride)
+            if len(expected) != stride or read_exact(fp, stride, item.name) != expected:
+                raise ValueError(f"{item.name}: encoded expert {expert} differs from source recipe")
+    else:
+        values = quantizer.to_f32(db, item.source)
+        expected = quantizer.encode(values, item.qtype)
+        fp.seek(offset)
+        if len(expected) != item.nbytes or read_exact(fp, item.nbytes, item.name) != expected:
+            raise ValueError(f"{item.name}: payload differs from source recipe")
+
+
 def write_engram(fp, item, db, np):
     # Keep weights and scales together without changing either byte. A chunk
     # holds 16K rows (4 MiB of weights), independent of the 94 GiB table size.
@@ -308,8 +362,34 @@ def write_gguf(args, plan, records, db):
     reserve_gib = getattr(args, "reserve_gib", 32)
     if reserve_gib < 0:
         raise ValueError("disk reserve must be nonnegative")
+    # With --unlink-consumed-shards the source is returned to the disk as the
+    # output grows: each shard is verified and deleted once its last tensor is
+    # written, so the space it holds counts as available for the output.
+    unlink = getattr(args, "unlink_consumed_shards", False)
+    shards_of = [item_shards(db, item) for item in plan]
+    pending = collections.Counter(shard for shards in shards_of[completed:] for shard in shards)
+    if unlink:
+        if os.path.samefile(os.path.dirname(os.path.abspath(args.out)), db.hf_dir) is False and \
+                shutil.disk_usage(db.hf_dir).free != free:
+            raise ValueError("--unlink-consumed-shards needs the source and the output on one volume")
+        free += sum(db.shard_bytes(shard) for shard in pending)
     if free < data_start + data_bytes - end + (reserve_gib << 30):
         raise ValueError(f"insufficient disk space for remaining output plus {reserve_gib} GiB reserve")
+    verified = set()
+
+    def release_consumed(fp, index):
+        write_position = fp.tell()
+        for shard in shards_of[index]:
+            pending[shard] -= 1
+            if pending[shard]:
+                continue
+            for j in range(completed, index + 1):
+                if shard in shards_of[j] and j not in verified:
+                    check_payload(fp, data_start + plan[j].offset, plan[j], db, quantizer, imatrix)
+                    verified.add(j)
+            db.release_shard(shard)
+            print(f"released {shard}", flush=True)
+        fp.seek(write_position)
     header = b"GGUF" + struct.pack("<IQQ", 3, len(plan), len(records))
     header += b"".join(records) + b"".join(tensor_header(item) for item in plan)
     header += bytes(data_start - len(header))
@@ -359,6 +439,8 @@ def write_gguf(args, plan, records, db):
             save_resume_state(journal, signature, index + 1)
             print(f"[{index + 1}/{len(plan)}] {item.name}: {item.nbytes / (1 << 30):.3f} GiB, "
                   f"{time.monotonic() - started:.1f}s, uncalibrated_experts={missing}", flush=True)
+            if unlink:
+                release_consumed(fp, index)
     os.rename(partial, args.out)
     os.unlink(journal)
 
@@ -377,6 +459,10 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--dspark-support", action="store_true",
                         help="convert only mtp.*; shared embedding/output come from the target")
+    parser.add_argument("--unlink-consumed-shards", action="store_true",
+                        help="verify and delete each source shard once its last tensor is written, "
+                             "so source and output need about one checkpoint of disk together; "
+                             "a --resume after a failure first needs the deleted shards re-downloaded")
     suffix = "dylib" if sys.platform == "darwin" else "so"
     parser.add_argument("--quants-library", default=os.path.join(os.path.dirname(__file__), f"libds4quants.{suffix}"))
     args = parser.parse_args()
