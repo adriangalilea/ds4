@@ -19078,10 +19078,17 @@ static int ds4_gpu_indexer_topk_tensor_impl(
     if (!selected || !scores || n_comp == 0 || n_tokens == 0 || top_k == 0 || top_k > n_comp) return 0;
 
     @autoreleasepool {
+        /* Non-causal rows (V4 Flash) default to the canonical (score desc,
+         * idx asc) total order — tie order among equal scores is the only
+         * output change; prerequisite for the streaming top-k below.
+         * Rollback env read per call.  The causal (V4.1) selectors keep
+         * upstream's comparator. */
         id<MTLComputePipelineState> sort_pipeline = causal_ratio ?
             ds4_gpu_get_pipeline(getenv("DS4_METAL_DISABLE_V41_TOPK_SHUFFLE") ?
                 "kernel_argsort_f32_i32_desc_causal" : "kernel_argsort_f32_i32_desc_causal_shuffle") :
-            g_argsort_f32_i32_desc_pipeline;
+            (getenv("DS4_METAL_DISABLE_ARGSORT_CANON") == NULL
+                ? ds4_gpu_get_pipeline("kernel_argsort_f32_i32_desc_canon")
+                : g_argsort_f32_i32_desc_pipeline);
         id<MTLComputePipelineState> merge_pipeline = causal_ratio ?
             ds4_gpu_get_pipeline(top_k == 512u && !getenv("DS4_METAL_DISABLE_V41_TOPK_PREFIX") ?
                 "kernel_argsort_merge_f32_i32_desc_causal_prefix" :
@@ -19102,8 +19109,9 @@ static int ds4_gpu_indexer_topk_tensor_impl(
          * in place of the padded bitonic + merge cascade.  Output list is
          * bit-identical to the CANON comparator path (same (score desc,
          * idx asc) total order).  Measured: cold64k 538->547 t/s (+1.7%),
-         * monotone with context. */
-        if (top_k == 512u && n_tokens >= 32u &&
+         * monotone with context.  Non-causal rows only: the V4.1 causal
+         * selectors bound each row's width and keep upstream's cascade. */
+        if (!causal_ratio && top_k == 512u && n_tokens >= 32u &&
             getenv("DS4_METAL_DISABLE_TOPK_STREAM512") == NULL) {
             static int logged_stream512;
             if (!logged_stream512) {
@@ -19143,14 +19151,6 @@ static int ds4_gpu_indexer_topk_tensor_impl(
             ds4_gpu_end_compute_encoder(cb, enc);
             return ds4_gpu_finish_command_buffer(cb, owned, "indexer topk stream512");
         }
-        /* Default (rollback env read per call): canonical (score desc,
-         * idx asc) total order — tie order among equal scores is the only
-         * output change; prerequisite for the streaming top-k above. */
-        id<MTLComputePipelineState> sort_pipeline =
-            getenv("DS4_METAL_DISABLE_ARGSORT_CANON") == NULL
-                ? ds4_gpu_get_pipeline("kernel_argsort_f32_i32_desc_canon")
-                : g_argsort_f32_i32_desc_pipeline;
-        if (!sort_pipeline) return 0;
         NSUInteger max_threads = sort_pipeline.maxTotalThreadsPerThreadgroup;
         if (max_threads == 0) max_threads = 256;
         int32_t nth = 1;
