@@ -262,8 +262,11 @@ def write_gguf(args, plan, records, db):
     end = data_start + (plan[completed - 1].offset +
                        align(plan[completed - 1].nbytes, GGUF_ALIGNMENT) if completed else 0)
     free = shutil.disk_usage(os.path.dirname(os.path.abspath(args.out))).free
-    if free < data_start + data_bytes - end + (32 << 30):
-        raise ValueError("insufficient disk space for remaining output plus 32 GiB reserve")
+    reserve_gib = getattr(args, "reserve_gib", 32)
+    if reserve_gib < 0:
+        raise ValueError("disk reserve must be nonnegative")
+    if free < data_start + data_bytes - end + (reserve_gib << 30):
+        raise ValueError(f"insufficient disk space for remaining output plus {reserve_gib} GiB reserve")
     header = b"GGUF" + struct.pack("<IQQ", 3, len(plan), len(records))
     header += b"".join(records) + b"".join(tensor_header(item) for item in plan)
     header += bytes(data_start - len(header))
@@ -324,6 +327,8 @@ def main():
     parser.add_argument("--imatrix")
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--reserve-gib", type=int, default=32,
+                        help="free disk space to retain after conversion (default: 32 GiB)")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--dspark-support", action="store_true",
                         help="convert only mtp.*; shared embedding/output come from the target")
