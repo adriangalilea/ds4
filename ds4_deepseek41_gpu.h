@@ -129,7 +129,8 @@ int ds4_gpu_dsv41_gather_kv(ds4_gpu_tensor *out, const ds4_gpu_tensor *source,
  * residual); norm = bf16(rmsnorm(x) * weight). `pre` is the coefficient row
  * of the PREVIOUS sublayer's split (the first four floats of that tensor).
  * expand4: out = bf16(post/comb expand of block into residual); when `pre`
- * is given, split[0..3] is also copied into it. */
+ * is given, split[0..3] is also copied into it; when `add` is given, block
+ * is first bf16(block + add) and that sum is written to block_sum. */
 int ds4_gpu_dsv41_hc_collapse_norm(ds4_gpu_tensor *split, ds4_gpu_tensor *x, ds4_gpu_tensor *norm,
                                   const ds4_gpu_tensor *mix, const ds4_gpu_tensor *pre,
                                   const ds4_gpu_tensor *residual,
@@ -140,7 +141,8 @@ int ds4_gpu_dsv41_hc_collapse_norm(ds4_gpu_tensor *split, ds4_gpu_tensor *x, ds4
                                   float hc_eps, float norm_eps);
 int ds4_gpu_dsv41_hc_expand4(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
                             const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split,
-                            ds4_gpu_tensor *pre, uint32_t n_embd);
+                            ds4_gpu_tensor *pre, const ds4_gpu_tensor *add,
+                            ds4_gpu_tensor *block_sum, uint32_t n_embd);
 /* Decode MoE glue for one token row, byte-identical to the standalone
  * sequences: router = F32 logits matvec + softplus/sqrt + bias + canonical
  * top-k + normalized weights in one dispatch; shared gate/up = two Q8_0

@@ -47711,7 +47711,7 @@ int ds4_gpu_dsv41_engram_add(ds4_gpu_tensor *residual,
 }
 
 /* V4.1 decode HC glue (metal/dsv41.metal): one token row, HC=4. */
-typedef struct { uint32_t n_embd, sinkhorn_iters; float hc_eps, norm_eps; uint32_t copy_pre; } ds4_gpu_dsv41_hc_args;
+typedef struct { uint32_t n_embd, sinkhorn_iters; float hc_eps, norm_eps; uint32_t copy_pre, has_add; } ds4_gpu_dsv41_hc_args;
 
 int ds4_gpu_dsv41_hc_collapse_norm(ds4_gpu_tensor *split, ds4_gpu_tensor *x, ds4_gpu_tensor *norm,
                                   const ds4_gpu_tensor *mix, const ds4_gpu_tensor *pre,
@@ -47744,7 +47744,7 @@ int ds4_gpu_dsv41_hc_collapse_norm(ds4_gpu_tensor *split, ds4_gpu_tensor *x, ds4
         id<MTLBuffer> normwbuf = ds4_gpu_wrap_model_range(model_map, model_size, norm_weight_offset,
                                                           weight_bytes, &norm_inner);
         if (!scalebuf || !basebuf || !normwbuf) return 0;
-        const ds4_gpu_dsv41_hc_args args = {n_embd, sinkhorn_iters, hc_eps, norm_eps, 0};
+        const ds4_gpu_dsv41_hc_args args = {n_embd, sinkhorn_iters, hc_eps, norm_eps, 0, 0};
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
@@ -47769,23 +47769,27 @@ int ds4_gpu_dsv41_hc_collapse_norm(ds4_gpu_tensor *split, ds4_gpu_tensor *x, ds4
 
 int ds4_gpu_dsv41_hc_expand4(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
                             const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split,
-                            ds4_gpu_tensor *pre, uint32_t n_embd) {
+                            ds4_gpu_tensor *pre, const ds4_gpu_tensor *add,
+                            ds4_gpu_tensor *block_sum, uint32_t n_embd) {
     if (!n_embd || !dsv41_tensor_has_floats(out, 4ull * n_embd) ||
         !dsv41_tensor_has_floats(block, n_embd) || !dsv41_tensor_has_floats(residual, 4ull * n_embd) ||
-        !dsv41_tensor_has_floats(split, 24) || (pre && !dsv41_tensor_has_floats(pre, 4))) return 0;
+        !dsv41_tensor_has_floats(split, 24) || (pre && !dsv41_tensor_has_floats(pre, 4)) ||
+        (add != NULL) != (block_sum != NULL) || (add && !dsv41_tensor_has_floats(add, n_embd)) ||
+        (block_sum && !dsv41_tensor_has_floats(block_sum, n_embd))) return 0;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     @autoreleasepool {
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline("kernel_dsv41_hc_expand4_bf16");
         if (!pipeline) return 0;
-        const ds4_gpu_dsv41_hc_args args = {n_embd, 0, 0.0f, 0.0f, pre != NULL};
+        const ds4_gpu_dsv41_hc_args args = {n_embd, 0, 0.0f, 0.0f, pre != NULL, add != NULL};
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         id<MTLComputeCommandEncoder> enc = cb ? ds4_gpu_compute_encoder(cb) : nil;
         if (!enc) return 0;
         [enc setComputePipelineState:pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
-        const ds4_gpu_tensor *buffers[] = {block, residual, split, out, pre ? pre : split};
-        for (NSUInteger i = 0; i < 5; i++)
+        const ds4_gpu_tensor *buffers[] = {block, residual, split, out, pre ? pre : split,
+                                           add ? add : block, block_sum ? block_sum : out};
+        for (NSUInteger i = 0; i < 7; i++)
             [enc setBuffer:ds4_gpu_tensor_buffer(buffers[i])
                     offset:ds4_gpu_tensor_offset(buffers[i]) atIndex:i + 1];
         [enc dispatchThreadgroups:MTLSizeMake(((uint64_t)n_embd + 255u) / 256u, 1, 1)
@@ -47928,7 +47932,7 @@ int ds4_gpu_dsv41_shared_down_hc_expand4(ds4_gpu_tensor *out, ds4_gpu_tensor *sh
         ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(n_ff, n_embd);
         ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
         mv_args.nr0 = mv_dispatch.nr0;
-        const ds4_gpu_dsv41_hc_args hc_args = {n_embd, 0, 0.0f, 0.0f, pre != NULL};
+        const ds4_gpu_dsv41_hc_args hc_args = {n_embd, 0, 0.0f, 0.0f, pre != NULL, 0};
         id<MTLComputePipelineState> pipeline =
             ds4_gpu_get_mul_mv_pipeline("kernel_dsv41_shared_down_hc_expand4_q8_0", mv_dispatch.nsg);
         if (!pipeline) return 0;

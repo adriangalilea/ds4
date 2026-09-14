@@ -374,7 +374,7 @@ static int check_hc_fuse(void) {
                 CHECK(ds4_gpu_hc_rms_norm_mix_f16_tensor(mix[1], residual, model, mapped, 0, N, OUT, rms_eps));
                 CHECK(ds4_gpu_dsv41_hc_collapse_norm(split[1], x[1], norm[1], mix[1], pre, residual,
                     model, mapped, scale_off, base_off, normw_off, D, HC, ITERS, hc_eps, rms_eps));
-                CHECK(ds4_gpu_dsv41_hc_expand4(out[1], block, residual, split[1], pre_next[1], D));
+                CHECK(ds4_gpu_dsv41_hc_expand4(out[1], block, residual, split[1], pre_next[1], NULL, NULL, D));
             }
             CHECK(ds4_gpu_end_commands());
             CHECK(ds4_gpu_synchronize());
@@ -499,6 +499,18 @@ static int check_moe_fuse(void) {
         CHECK(!memcmp(ds4_gpu_tensor_contents(selected[0]), sel, K * 4));
         CHECK(!memcmp(ds4_gpu_tensor_contents(weights[0]), ds4_gpu_tensor_contents(weights[1]), K * 4));
         CHECK(!memcmp(ds4_gpu_tensor_contents(mid[0]), ds4_gpu_tensor_contents(mid[1]), FF * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(shared[0]), ds4_gpu_tensor_contents(shared[1]), D * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(block[0]), ds4_gpu_tensor_contents(block[1]), D * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(out[0]), ds4_gpu_tensor_contents(out[1]), N * 4));
+        CHECK(!memcmp(ds4_gpu_tensor_contents(pre[0]), ds4_gpu_tensor_contents(pre[1]), 16));
+        /* The early-down variant: standalone down + BF16, then the sum and
+         * its rounding folded into the expand. */
+        CHECK(ds4_gpu_begin_commands());
+        CHECK(ds4_gpu_matmul_q8_0_tensor(shared[1], model, mapped, down_off, FF, D, mid[1], 1));
+        CHECK(ds4_gpu_dsv41_quantize(shared[1], D, 1, DS4_V41_BF16));
+        CHECK(ds4_gpu_dsv41_hc_expand4(out[1], routed, residual, split, pre[1], shared[1], block[1], D));
+        CHECK(ds4_gpu_end_commands());
+        CHECK(ds4_gpu_synchronize());
         CHECK(!memcmp(ds4_gpu_tensor_contents(shared[0]), ds4_gpu_tensor_contents(shared[1]), D * 4));
         CHECK(!memcmp(ds4_gpu_tensor_contents(block[0]), ds4_gpu_tensor_contents(block[1]), D * 4));
         CHECK(!memcmp(ds4_gpu_tensor_contents(out[0]), ds4_gpu_tensor_contents(out[1]), N * 4));
