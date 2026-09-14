@@ -476,6 +476,7 @@ struct ds4_metal_args_dsv41_router {
     uint  n_used;
     uint  has_bias;
     float scale;
+    uint  fused_matvec;
 };
 
 /* Router logits (F32 matvec, kernel_mul_mv_f32_f32_4 with nsg=8, nr0=2) and
@@ -483,8 +484,12 @@ struct ds4_metal_args_dsv41_router {
  * probs = sqrt(softplus(logits)); score = probs + bias; top-k in the
  * canonical (score desc, idx asc) order of kernel_argsort_f32_i32_desc_canon;
  * weights = (probs[sel] / max(sum, 2^-14)) * scale, where sum is
- * kernel_sum_rows_f32_f32's six-lane simd reduction.  The last-arriving
- * threadgroup selects (DeepSeek's Mega-Gate shape). */
+ * kernel_sum_rows_f32_f32's six-lane simd reduction.
+ * fused_matvec: the last-arriving threadgroup selects (DeepSeek's Mega-Gate
+ * shape); the host enables it on M5 only, like V4's fused router: on the
+ * M3 Ultra the other groups' logits were not reliably visible to the last
+ * one (nondeterministic probs).  Otherwise one threadgroup selects from
+ * logits produced by the standalone matvec dispatch. */
 kernel void kernel_dsv41_router_select(
         constant ds4_metal_args_dsv41_router &args,
         device const float *weight,
@@ -500,52 +505,54 @@ kernel void kernel_dsv41_router_select(
         ushort tid [[thread_index_in_threadgroup]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    constexpr short NSG = 8;
-    constexpr short NR0 = 2;
-    constexpr short NB  = 32;
-    constexpr short NF  = 16;
-    constexpr short NF4 = NF/4;
-    constexpr short NW  = N_SIMDWIDTH;
-    const int nb = (int)args.n_embd/NB;
-    const int r0 = tgpig.x*NR0;
-    device const float4 *y4 = (device const float4 *)x;
-    device const float4 *ax4[NR0];
-    FOR_UNROLL (short row = 0; row < NR0; ++row) {
-        ax4[row] = (device const float4 *)(weight + (uint64_t)(r0 + row)*args.n_embd);
-    }
-    float sumf[NR0] = {0.f};
-    const short ix = tiisg/(NW/NF);
-    const short il = tiisg%(NW/NF);
-    const int ib0 = sgitg*NF + ix;
-    device const float4 *yb4 = y4 + (ib0*NB + il*NF)/4;
-    for (int ib = ib0; ib < nb; ib += NSG*NF) {
-        float4 yl4[NF4];
-        FOR_UNROLL (short i = 0; i < NF4; ++i) yl4[i] = yb4[i];
+    if (args.fused_matvec) {
+        constexpr short NSG = 8;
+        constexpr short NR0 = 2;
+        constexpr short NB  = 32;
+        constexpr short NF  = 16;
+        constexpr short NF4 = NF/4;
+        constexpr short NW  = N_SIMDWIDTH;
+        const int nb = (int)args.n_embd/NB;
+        const int r0 = tgpig.x*NR0;
+        device const float4 *y4 = (device const float4 *)x;
+        device const float4 *ax4[NR0];
         FOR_UNROLL (short row = 0; row < NR0; ++row) {
-            device const float4 *xb4 = ax4[row] + (ib*NB + il*NF)/4;
-            float sumq = 0.f;
-            FOR_UNROLL (short i = 0; i < NF4; ++i) sumq += dot(float4(xb4[i]), float4(yl4[i]));
-            sumf[row] += sumq;
+            ax4[row] = (device const float4 *)(weight + (uint64_t)(r0 + row)*args.n_embd);
         }
-        yb4 += NSG*NF*NW/4;
-    }
-    for (int i = nb*NB + sgitg*NW + tiisg; i < (int)args.n_embd; i += NW*NSG) {
-        FOR_UNROLL (short row = 0; row < NR0; ++row) {
-            sumf[row] += ((device const float *)ax4[row])[i] * x[i];
+        float sumf[NR0] = {0.f};
+        const short ix = tiisg/(NW/NF);
+        const short il = tiisg%(NW/NF);
+        const int ib0 = sgitg*NF + ix;
+        device const float4 *yb4 = y4 + (ib0*NB + il*NF)/4;
+        for (int ib = ib0; ib < nb; ib += NSG*NF) {
+            float4 yl4[NF4];
+            FOR_UNROLL (short i = 0; i < NF4; ++i) yl4[i] = yb4[i];
+            FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                device const float4 *xb4 = ax4[row] + (ib*NB + il*NF)/4;
+                float sumq = 0.f;
+                FOR_UNROLL (short i = 0; i < NF4; ++i) sumq += dot(float4(xb4[i]), float4(yl4[i]));
+                sumf[row] += sumq;
+            }
+            yb4 += NSG*NF*NW/4;
         }
-    }
-    helper_mv_reduce_and_write<NR0>(logits, sumf, r0, (int)args.n_expert,
-                                    tiisg, sgitg, (threadgroup char *)scratch);
+        for (int i = nb*NB + sgitg*NW + tiisg; i < (int)args.n_embd; i += NW*NSG) {
+            FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                sumf[row] += ((device const float *)ax4[row])[i] * x[i];
+            }
+        }
+        helper_mv_reduce_and_write<NR0>(logits, sumf, r0, (int)args.n_expert,
+                                        tiisg, sgitg, (threadgroup char *)scratch);
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-    if (tid == 0) {
-        const uint old = atomic_fetch_add_explicit(completion, 1u, memory_order_relaxed);
-        scratch[0] = old + 1u == (args.n_expert + 1u) / 2u ? 1.0f : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        if (tid == 0) {
+            const uint old = atomic_fetch_add_explicit(completion, 1u, memory_order_relaxed);
+            scratch[0] = old + 1u == (args.n_expert + 1u) / 2u ? 1.0f : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (scratch[0] == 0.0f) return;
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (scratch[0] == 0.0f) return;
-    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
 
     constexpr uint SLOTS = 512;
     threadgroup float *score_tg = scratch;                          /* SLOTS */
@@ -616,9 +623,11 @@ kernel void kernel_dsv41_router_select(
         selected[tid] = sel_tg[tid];
         weights[tid] = stage[1 + tid] * args.scale;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-    if (tid == 0) atomic_store_explicit(completion, 0u, memory_order_relaxed);
+    if (args.fused_matvec) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        if (tid == 0) atomic_store_explicit(completion, 0u, memory_order_relaxed);
+    }
 }
 
 /* Shared expert gate/up (Q8_0, kernel_mul_mv_q8_0_f32's walk and reduction
