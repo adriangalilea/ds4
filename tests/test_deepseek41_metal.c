@@ -410,6 +410,51 @@ static void fill_q8_0(uint8_t *dst, size_t rows, size_t k) {
     }
 }
 
+static int check_q8_decode_rows(void) {
+    const uint32_t shapes[][2] = {
+        {32, 64}, {1280, 32768}, {5120, 2304}, {2304, 5120},
+        {8192, 5120}, {32, 65568}
+    };
+    enum { ROWS = 9 };
+    for (size_t shape = 0; shape < sizeof(shapes) / sizeof(*shapes); shape++) {
+        const uint32_t in = shapes[shape][0], out = shapes[shape][1];
+        const size_t bytes = (size_t)in / 32 * out * 34;
+        void *model = NULL;
+        CHECK(posix_memalign(&model, getpagesize(), bytes) == 0);
+        fill_q8_0(model, out, in);
+        CHECK(ds4_gpu_set_model_map(model, bytes));
+        ds4_gpu_tensor *x = upload(NULL, (size_t)ROWS * in * 4);
+        ds4_gpu_tensor *ref = upload(NULL, (size_t)ROWS * out * 4);
+        ds4_gpu_tensor *actual = upload(NULL, (size_t)(ROWS + 1) * out * 4);
+        CHECK(x && ref && actual);
+        float *input = ds4_gpu_tensor_contents(x);
+        for (size_t i = 0; i < (size_t)ROWS * in; i++) input[i] = random_value() / 3;
+        CHECK(ds4_gpu_begin_commands());
+        for (uint32_t row = 0; row < ROWS; row++) {
+            ds4_gpu_tensor *xr = ds4_gpu_tensor_view(x, (size_t)row * in * 4, in * 4);
+            ds4_gpu_tensor *yr = ds4_gpu_tensor_view(ref, (size_t)row * out * 4, out * 4);
+            CHECK(xr && yr && ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                yr, model, bytes, 0, in, out, xr, 1));
+            ds4_gpu_tensor_free(xr); ds4_gpu_tensor_free(yr);
+        }
+        CHECK(ds4_gpu_end_commands());
+        for (uint32_t rows = 1; rows <= ROWS; rows++) {
+            CHECK(ds4_gpu_tensor_fill_f32(actual, NAN, (size_t)(ROWS + 1) * out));
+            CHECK(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                actual, model, bytes, 0, in, out, x, rows));
+            CHECK(ds4_gpu_synchronize());
+            const float *got = ds4_gpu_tensor_contents(actual);
+            CHECK(!memcmp(got, ds4_gpu_tensor_contents(ref), (size_t)rows * out * 4));
+            CHECK(isnan(got[(size_t)rows * out]));
+        }
+        fprintf(stderr, "Q8 decode rows 1..9 in=%u out=%u: byte-identical\n", in, out);
+        ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(ref); ds4_gpu_tensor_free(actual);
+        ds4_gpu_cleanup(); free(model);
+        CHECK(ds4_gpu_init());
+    }
+    return 1;
+}
+
 /* The fused decode MoE glue (router + select, shared gate/up/SwiGLU, shared
  * down + sum + HC expand) must be byte-identical to the 22-dispatch
  * standalone sequence at V4.1's shape (5120 x 384 F32 router, 6 of 384,
@@ -1588,6 +1633,11 @@ static int check_tp_attention(void) {
 
 int main(int argc, char **argv) {
 #ifdef __APPLE__
+    if (argc == 2 && !strcmp(argv[1], "--q8-decode-rows")) {
+        const int ok = ds4_gpu_init() && check_q8_decode_rows();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--attention-output-exact")) {
         const int ok = ds4_gpu_init() && check_attention_output(2);
         ds4_gpu_cleanup();

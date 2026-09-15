@@ -19842,8 +19842,14 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         args.ne1 = (int32_t)n_rows;
         args.nr0 = dispatch.nr0;
 
+        static int interleave_disabled = -1;
+        if (interleave_disabled < 0) interleave_disabled =
+            getenv("DS4_METAL_DISABLE_Q8_DECODE_ROW_INTERLEAVE") != NULL;
+        const bool interleave = n_rows >= 2 && n_rows <= 8 && !interleave_disabled;
         id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mv_pipeline(dispatch.function_name, dispatch.nsg);
+            ds4_gpu_get_mul_mv_pipeline(interleave ?
+                "kernel_mul_mv_q8_0_f32_interleaved_rows" : dispatch.function_name,
+                dispatch.nsg);
         if (!pipeline) return 0;
 
         int owned = 0;
@@ -19856,12 +19862,10 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
         [enc setThreadgroupMemoryLength:dispatch.smem atIndex:0];
+        const NSUInteger tiles = ((NSUInteger)out_dim + dispatch.nr0 - 1u) / dispatch.nr0;
         [enc dispatchThreadgroups:
-                MTLSizeMake(((NSUInteger)out_dim +
-                             (NSUInteger)dispatch.nr0 - 1u) /
-                                (NSUInteger)dispatch.nr0,
-                            (NSUInteger)n_rows,
-                            1)
+                MTLSizeMake(tiles * (interleave ? n_rows : 1u),
+                            interleave ? 1u : n_rows, 1)
              threadsPerThreadgroup:
                 MTLSizeMake(32, (NSUInteger)dispatch.nsg, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
