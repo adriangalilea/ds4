@@ -44262,7 +44262,7 @@ int ds4_gpu_routed_moe_batch_tensor(
                 gate_rows_per_group_is_nr0, 1, stream_overflow_up);
         } else if (use_tiny_pair_swiglu) {
             id<MTLBuffer> expert_members = nil;
-            if (v41_decode_batch && n_tokens >= 2 && g_tp_split_world <= 1 &&
+            if (v41_decode_batch && n_tokens >= 4 && g_tp_split_world <= 1 &&
                 !g_ssd_streaming_mode && gate_type == DS4_METAL_TENSOR_MXFP4 &&
                 !getenv("DS4_METAL_DISABLE_V41_EXPERT_UNION_GATE")) {
                 id<MTLComputePipelineState> map_pipeline =
