@@ -158,6 +158,10 @@ int ds4_gpu_dsv41_shared_gate_up_swiglu(ds4_gpu_tensor *mid, const ds4_gpu_tenso
                                        const void *model_map, uint64_t model_size,
                                        uint64_t gate_offset, uint64_t up_offset,
                                        uint32_t n_embd, uint32_t n_ff, float clamp);
+int ds4_gpu_dsv41_shared_gate_up_swiglu_rows(ds4_gpu_tensor *mid, const ds4_gpu_tensor *x,
+                                       const void *model_map, uint64_t model_size,
+                                       uint64_t gate_offset, uint64_t up_offset,
+                                       uint32_t n_embd, uint32_t n_ff, float clamp, uint32_t rows);
 /* Decode attention glue for one token row, byte-identical to the standalone
  * sequences.  matvec_bf16: a Q8_0 or F16 single-row matvec whose store is
  * the BF16 rounding (1 done, 0 not covered, -1 error).  qkv_norm_kv_tail:

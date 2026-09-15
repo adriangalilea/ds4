@@ -48291,10 +48291,19 @@ int ds4_gpu_dsv41_shared_gate_up_swiglu(ds4_gpu_tensor *mid, const ds4_gpu_tenso
                                        const void *model_map, uint64_t model_size,
                                        uint64_t gate_offset, uint64_t up_offset,
                                        uint32_t n_embd, uint32_t n_ff, float clamp) {
+    return ds4_gpu_dsv41_shared_gate_up_swiglu_rows(mid, x, model_map, model_size,
+        gate_offset, up_offset, n_embd, n_ff, clamp, 1);
+}
+
+int ds4_gpu_dsv41_shared_gate_up_swiglu_rows(ds4_gpu_tensor *mid, const ds4_gpu_tensor *x,
+                                       const void *model_map, uint64_t model_size,
+                                       uint64_t gate_offset, uint64_t up_offset,
+                                       uint32_t n_embd, uint32_t n_ff, float clamp, uint32_t rows) {
     const uint64_t row_bytes = ((uint64_t)n_embd / 32u) * 34u;
     const uint64_t weight_bytes = row_bytes * n_ff;
-    if (!n_embd || n_embd % 32u || !n_ff || !model_map || !isfinite(clamp) || clamp < 0.0f ||
-        !dsv41_tensor_has_floats(x, n_embd) || !dsv41_tensor_has_floats(mid, n_ff) ||
+    if (!rows || rows > 8u || !n_embd || n_embd % 32u || !n_ff || !model_map || !isfinite(clamp) || clamp < 0.0f ||
+        !dsv41_tensor_has_floats(x, (uint64_t)rows * n_embd) ||
+        !dsv41_tensor_has_floats(mid, (uint64_t)rows * n_ff) ||
         gate_offset > model_size || weight_bytes > model_size - gate_offset ||
         up_offset > model_size || weight_bytes > model_size - up_offset) return 0;
     if (!g_initialized && !ds4_gpu_init()) return 0;
@@ -48306,6 +48315,7 @@ int ds4_gpu_dsv41_shared_gate_up_swiglu(ds4_gpu_tensor *mid, const ds4_gpu_tenso
         ds4_gpu_q8_0_matvec_args args = ds4_gpu_make_q8_0_mv_args(n_embd, n_ff);
         ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
         args.nr0 = mv_dispatch.nr0;
+        args.ne1 = (int32_t)rows;
         id<MTLComputePipelineState> pipeline =
             ds4_gpu_get_mul_mv_pipeline("kernel_dsv41_shared_gate_up_swiglu_q8_0", mv_dispatch.nsg);
         if (!pipeline) return 0;
@@ -48322,7 +48332,7 @@ int ds4_gpu_dsv41_shared_gate_up_swiglu(ds4_gpu_tensor *mid, const ds4_gpu_tenso
         [enc setBytes:&clamp length:sizeof(clamp) atIndex:5];
         [enc setThreadgroupMemoryLength:2u * mv_dispatch.smem atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_ff + (NSUInteger)mv_dispatch.nr0 - 1u) /
-                                              (NSUInteger)mv_dispatch.nr0, 1, 1)
+                                              (NSUInteger)mv_dispatch.nr0 * rows, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(cb, owned, "V4.1 shared gate/up");

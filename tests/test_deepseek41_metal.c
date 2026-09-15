@@ -410,6 +410,57 @@ static void fill_q8_0(uint8_t *dst, size_t rows, size_t k) {
     }
 }
 
+static int check_shared_fuse_rows(void) {
+    enum { D = 5120, FF = 2304, ROWS = 8 };
+    const size_t weight_bytes = (size_t)FF * (D / 32) * 34;
+    void *model = NULL;
+    CHECK(posix_memalign(&model, getpagesize(), 2 * weight_bytes) == 0);
+    fill_q8_0(model, 2 * FF, D);
+    CHECK(ds4_gpu_set_model_map(model, 2 * weight_bytes));
+    ds4_gpu_tensor *x = upload(NULL, ROWS * D * 4);
+    ds4_gpu_tensor *gate = upload(NULL, FF * 4), *up = upload(NULL, FF * 4);
+    ds4_gpu_tensor *ref = upload(NULL, ROWS * FF * 4);
+    ds4_gpu_tensor *actual = upload(NULL, (ROWS + 1) * FF * 4);
+    CHECK(x && gate && up && ref && actual);
+    float *input = ds4_gpu_tensor_contents(x);
+    for (int i = 0; i < ROWS * D; i++) input[i] = bf16(random_value());
+    for (int trial = 0; trial < 2; trial++) {
+        const float clamp = trial ? 10.0f : 0.0f;
+        CHECK(ds4_gpu_begin_commands());
+        for (uint32_t row = 0; row < ROWS; row++) {
+            ds4_gpu_tensor *xr = ds4_gpu_tensor_view(x, (size_t)row * D * 4, D * 4);
+            ds4_gpu_tensor *yr = ds4_gpu_tensor_view(ref, (size_t)row * FF * 4, FF * 4);
+            CHECK(xr && yr);
+            CHECK(ds4_gpu_matmul_q8_0_tensor(gate, model, 2 * weight_bytes, 0, D, FF, xr, 1));
+            CHECK(ds4_gpu_dsv41_quantize(gate, FF, 1, DS4_V41_BF16));
+            CHECK(ds4_gpu_matmul_q8_0_tensor(up, model, 2 * weight_bytes, weight_bytes, D, FF, xr, 1));
+            CHECK(ds4_gpu_dsv41_quantize(up, FF, 1, DS4_V41_BF16));
+            CHECK(ds4_gpu_swiglu_tensor(yr, gate, up, FF, clamp, 1.0f));
+            CHECK(ds4_gpu_dsv41_quantize(yr, FF, 1, DS4_V41_BF16));
+            ds4_gpu_tensor_free(xr); ds4_gpu_tensor_free(yr);
+        }
+        CHECK(ds4_gpu_end_commands());
+        for (uint32_t rows = 1; rows <= ROWS; rows++) {
+            CHECK(ds4_gpu_tensor_fill_f32(actual, NAN, (ROWS + 1) * FF));
+            CHECK(ds4_gpu_dsv41_shared_gate_up_swiglu_rows(actual, x,
+                model, 2 * weight_bytes, 0, weight_bytes, D, FF, clamp, rows));
+            CHECK(ds4_gpu_synchronize());
+            const float *got = ds4_gpu_tensor_contents(actual);
+            CHECK(!memcmp(got, ds4_gpu_tensor_contents(ref), (size_t)rows * FF * 4));
+            CHECK(isnan(got[(size_t)rows * FF]));
+        }
+        fprintf(stderr, "V4.1 shared fusion rows 1..8 clamp=%g: byte-identical\n", clamp);
+    }
+    CHECK(!ds4_gpu_dsv41_shared_gate_up_swiglu_rows(actual, x,
+        model, 2 * weight_bytes, 0, weight_bytes, D, FF, 10, 0));
+    CHECK(!ds4_gpu_dsv41_shared_gate_up_swiglu_rows(actual, x,
+        model, 2 * weight_bytes, 0, weight_bytes, D, FF, 10, ROWS + 1));
+    ds4_gpu_tensor_free(x); ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(up);
+    ds4_gpu_tensor_free(ref); ds4_gpu_tensor_free(actual);
+    ds4_gpu_cleanup(); free(model);
+    return 1;
+}
+
 static int check_q8_decode_rows(void) {
     const uint32_t shapes[][2] = {
         {32, 64}, {1280, 32768}, {5120, 2304}, {2304, 5120},
@@ -1633,6 +1684,11 @@ static int check_tp_attention(void) {
 
 int main(int argc, char **argv) {
 #ifdef __APPLE__
+    if (argc == 2 && !strcmp(argv[1], "--shared-fuse-rows")) {
+        const int ok = ds4_gpu_init() && check_shared_fuse_rows();
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--q8-decode-rows")) {
         const int ok = ds4_gpu_init() && check_q8_decode_rows();
         ds4_gpu_cleanup();

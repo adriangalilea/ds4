@@ -904,8 +904,9 @@ kernel void kernel_dsv41_shared_gate_up_swiglu_q8_0(
     constexpr short NQ = 8;
 
     const int nb = args.ne00 / QK8_0;
-    const int r0 = tgpig.x * NR0;
-    device const float *y = (device const float *)src1;
+    const uint token = tgpig.x % uint(args.ne1);
+    const int r0 = (tgpig.x / uint(args.ne1)) * NR0;
+    device const float *y = (device const float *)(src1 + (uint64_t)token * args.nb11);
 
     device const block_q8_0 *ag[NR0];
     device const block_q8_0 *au[NR0];
@@ -962,7 +963,7 @@ kernel void kernel_dsv41_shared_gate_up_swiglu_q8_0(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    device float *mid_f32 = (device float *)dst_mid;
+    device float *mid_f32 = (device float *)dst_mid + (uint64_t)token * args.ne0;
     FOR_UNROLL (short row = 0; row < NR0 && r0 + row < args.ne01; ++row) {
         const float gate = simd_sum(sh_gate[row][tiisg]);
         const float up = simd_sum(sh_up[row][tiisg]);
@@ -978,4 +979,3 @@ kernel void kernel_dsv41_shared_gate_up_swiglu_q8_0(
         }
     }
 }
-
