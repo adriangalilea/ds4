@@ -43503,13 +43503,14 @@ int ds4_gpu_routed_moe_batch_tensor(
             !getenv("DS4_METAL_DISABLE_V41_PACKED_M32N128");
         /* Tiny verification and session batches reuse the fused decode kernels.
          * V4.1 needs scalar reduction order before its BF16/router boundaries
-         * through eight rows, for both routed recipes. Larger prefills retain
+         * through eight rows, for all routed recipes. Larger prefills retain
          * the grouped matmul path. */
         const bool v41_decode_batch = n_tokens <= 8u && n_total_expert == 384u &&
             n_expert == 6u && expert_in_dim == 5120u && expert_mid_dim == 2304u &&
             out_dim == 5120u &&
             ((gate_type == DS4_METAL_TENSOR_IQ2_XXS && down_type == DS4_METAL_TENSOR_Q2_K) ||
-             (gate_type == DS4_METAL_TENSOR_Q4_K && down_type == DS4_METAL_TENSOR_Q4_K));
+             (gate_type == DS4_METAL_TENSOR_Q4_K && down_type == DS4_METAL_TENSOR_Q4_K) ||
+             (gate_type == DS4_METAL_TENSOR_MXFP4 && down_type == DS4_METAL_TENSOR_MXFP4));
         const bool use_tiny_pair_mv =
             !g_quality_mode &&
             (n_tokens <= 5u || v41_decode_batch ||
