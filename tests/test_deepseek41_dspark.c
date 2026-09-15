@@ -431,7 +431,114 @@ done:
     return rc;
 }
 
+/* Two independent target states advance over the same greedy inputs. Every
+ * batch row publishes logits; no rejected draft or rollback is involved. */
+static int check_verify_rows(const char *target_path, const char *prompt_path,
+                              uint32_t cap) {
+    int rc = 1;
+    ds4_engine *engine = NULL;
+    ds4_session *scalar = NULL, *batch = NULL;
+    ds4_gpu_tensor *output = NULL;
+    ds4_tokens prompt_tokens = {0};
+    char *prompt = NULL, err[256] = {0};
+    size_t prompt_bytes = 0;
+    float *expected = NULL, *actual = NULL;
+    ds4_engine_options opt = {.model_path = target_path,
+        .backend = DS4_BACKEND_METAL, .context_size = 32768, .power_percent = 100};
+    CHECK(cap >= 2 && cap <= 6);
+    CHECK(imatrix_read_text_file(prompt_path, &prompt, &prompt_bytes));
+    CHECK(prompt_bytes && ds4_engine_open(&engine, &opt) == 0);
+    CHECK(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41);
+    ds4_encode_chat_prompt(engine, NULL, prompt, DS4_THINK_NONE, &prompt_tokens);
+    CHECK(prompt_tokens.len > 1 && prompt_tokens.len + 256 < 32768);
+    CHECK(ds4_session_create(&scalar, engine, 32768) == 0);
+    CHECK(ds4_session_create(&batch, engine, 32768) == 0);
+    CHECK(ds4_session_sync(scalar, &prompt_tokens, err, sizeof(err)) == 0);
+    CHECK(ds4_session_sync(batch, &prompt_tokens, err, sizeof(err)) == 0);
+    const size_t row_bytes = (size_t)DS4_N_VOCAB * sizeof(float);
+    CHECK(!memcmp(scalar->logits, batch->logits, row_bytes));
+    expected = malloc(cap * row_bytes);
+    actual = malloc(cap * row_bytes);
+    output = ds4_gpu_tensor_alloc(cap * row_bytes);
+    CHECK(expected && actual && output);
+    double scalar_ms = 0, batch_ms = 0;
+    uint32_t mismatches = 0, different_rows = 0, batches = 0;
+    int generated[256];
+    for (uint32_t first = 0; first < 256;) {
+        const uint32_t rows = 256u - first < cap ? 256u - first : cap;
+        ds41_gpu_graph *graphs[6];
+        for (uint32_t i = 0; i < rows; i++) {
+            graphs[i] = &batch->ds41_graph;
+            const int token = sample_argmax(scalar->logits, DS4_N_VOCAB);
+            CHECK(!vocab_token_is_generation_stop(&engine->vocab, token));
+            generated[first + i] = token;
+            const double t0 = now_sec();
+            CHECK(ds41_graph_step(&scalar->ds41_graph, &engine->model,
+                                   &engine->weights, token, scalar->logits));
+            scalar_ms += (now_sec() - t0) * 1000;
+            memcpy(expected + (size_t)i * DS4_N_VOCAB, scalar->logits, row_bytes);
+        }
+        const double t0 = now_sec();
+        if (rows == 1) {
+            CHECK(ds41_graph_step(&batch->ds41_graph, &engine->model,
+                                   &engine->weights, generated[first], actual));
+        } else {
+            CHECK(ds4_gpu_begin_commands());
+            CHECK(ds41_graph_step_batch_outputs(graphs, generated + first, (int)rows,
+                rows, &engine->model, &engine->weights, output));
+            CHECK(ds4_gpu_end_commands());
+            CHECK(ds4_gpu_tensor_read(output, 0, actual, rows * row_bytes));
+        }
+        const double elapsed = (now_sec() - t0) * 1000;
+        batch_ms += elapsed;
+        CHECK(batch->ds41_graph.pos == scalar->ds41_graph.pos);
+        CHECK(!memcmp(&batch->ds41_graph.history, &scalar->ds41_graph.history,
+                       sizeof(batch->ds41_graph.history)));
+        for (uint32_t i = 0; i < rows; i++) {
+            const float *a = expected + (size_t)i * DS4_N_VOCAB;
+            const float *b = actual + (size_t)i * DS4_N_VOCAB;
+            const int want = sample_argmax(a, DS4_N_VOCAB);
+            const int got = sample_argmax(b, DS4_N_VOCAB);
+            bool finite = true;
+            for (uint32_t j = 0; j < DS4_N_VOCAB; j++) finite &= isfinite(b[j]);
+            CHECK(finite);
+            const bool equal = !memcmp(a, b, row_bytes);
+            different_rows += !equal;
+            mismatches += want != got;
+            fprintf(stderr, "verify row=%u rows=%u expected=%d actual=%d logits_exact=%d\n",
+                    first + i, rows, want, got, equal);
+        }
+        fprintf(stderr, "verify_batch first=%u rows=%u ms=%.6f\n", first, rows, elapsed);
+        batches++;
+        first += rows;
+    }
+    fprintf(stderr, "V4.1 verify prompt_tokens=%d cap=%u rows=256 batches=%u scalar_ms=%.3f batch_ms=%.3f top1_mismatches=%u different_logit_rows=%u\n",
+            prompt_tokens.len, cap, batches, scalar_ms, batch_ms, mismatches, different_rows);
+    fprintf(stderr, "target_tokens=");
+    for (uint32_t i = 0; i < 256; i++) {
+        fprintf(stderr, "%s%d", i ? "," : "", generated[i]);
+        size_t len = 0;
+        char *piece = ds4_token_text(engine, generated[i], &len);
+        CHECK(piece);
+        fwrite(piece, 1, len, stdout);
+        free(piece);
+    }
+    fputc('\n', stderr);
+    rc = mismatches ? 1 : 0;
+done:
+    if (rc) fprintf(stderr, "V4.1 verify probe failed: %s\n", err);
+    if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
+    ds4_gpu_tensor_free(output);
+    free(expected); free(actual); free(prompt);
+    ds4_tokens_free(&prompt_tokens);
+    ds4_session_free(batch); ds4_session_free(scalar);
+    ds4_engine_close(engine);
+    return rc;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 5 && !strcmp(argv[1], "--verify-rows"))
+        return check_verify_rows(argv[2], argv[3], (uint32_t)atoi(argv[4]));
     if (argc == 8 && !strcmp(argv[1], "--replay")) return replay_taps(argv);
     if (argc == 2 && !strcmp(argv[1], "--capture")) return check_capture();
     if (argc == 6 && !strcmp(argv[1], "--live") &&

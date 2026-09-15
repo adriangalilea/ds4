@@ -41716,9 +41716,10 @@ static uint32_t ds41_short_prefill_count(const ds41_gpu_graph *g, const ds4_weig
     return remaining < DS4_TP_BATCH_MAX_ROWS ? remaining : DS4_TP_BATCH_MAX_ROWS;
 }
 
-static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *tokens, int count,
+static bool ds41_graph_step_batch_outputs(ds41_gpu_graph *const *graphs, const int *tokens, int count,
                                    uint32_t prefill_rows,
-                                   const ds4_model *model, const ds4_weights *weights) {
+                                   const ds4_model *model, const ds4_weights *weights,
+                                   ds4_gpu_tensor *row_logits) {
     if (!graphs || !tokens || count < 2 || count > DS4_TP_BATCH_MAX_ROWS ||
         prefill_rows > (uint32_t)count) return false;
     /* Sparse block masks scale with context, even when prefill caps match.
@@ -41726,7 +41727,16 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     ds41_gpu_graph *g = ds41_batch_workspace(graphs, count);
     if (!g) return false;
     const uint32_t rows = (uint32_t)count;
-    const bool prefill_only = prefill_rows == rows;
+    if (row_logits) {
+        if (prefill_rows != rows || g->tp_world != 1 || g->streaming ||
+            !g->valid || g->pos > g->ctx || rows > g->ctx - g->pos ||
+            ds4_gpu_tensor_bytes(row_logits) < (uint64_t)rows * DS4_N_VOCAB * sizeof(float))
+            return false;
+        for (int i = 0; i < count; i++)
+            if (graphs[i] != g || tokens[i] < 0 || (uint32_t)tokens[i] >= DS4_N_VOCAB)
+                return false;
+    }
+    const bool prefill_only = prefill_rows == rows && !row_logits;
     const bool shared_owner = g->tp_world == 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     ds41_prefill_row active = {0};
@@ -41834,9 +41844,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             ds4_gpu_tensor_copy(g->rows_view[i].norm, 0, s->norm, 0, DS4_N_EMBD * sizeof(float)) :
             ds41_output_projection(s, s->tp_logits_half ? s->tp_logits_half : s->logits,
                                     model, weights, s->norm, 1);
+        if (ok && row_logits && !batch_logits)
+            ok = ds4_gpu_tensor_copy(row_logits, (uint64_t)i * logits_bytes,
+                                     s->logits, 0, logits_bytes);
     }
     if (ok && batch_logits)
         ok = ds41_output_projection(g, batch_logits, model, weights, active.norm, rows);
+    if (ok && row_logits && batch_logits)
+        ok = ds4_gpu_tensor_copy(row_logits, 0, batch_logits, 0, rows * logits_bytes);
     for (int i = first_output; ok && i < count; i++) {
         ds41_gpu_graph *s = graphs[i];
         if (batch_logits)
@@ -41855,6 +41870,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     }
     free(engram);
     return ok;
+}
+
+static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs,
+                                   const int *tokens, int count, uint32_t prefill_rows,
+                                   const ds4_model *model, const ds4_weights *weights) {
+    return ds41_graph_step_batch_outputs(graphs, tokens, count, prefill_rows,
+                                         model, weights, NULL);
 }
 
 static bool ds41_graph_short_prefill(ds41_gpu_graph *g, const ds4_model *m,
