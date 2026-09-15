@@ -41727,6 +41727,14 @@ static bool ds41_graph_step_batch_outputs(ds41_gpu_graph *const *graphs, const i
     ds41_gpu_graph *g = ds41_batch_workspace(graphs, count);
     if (!g) return false;
     const uint32_t rows = (uint32_t)count;
+#ifdef __APPLE__
+    static int batch_output_disabled = -1;
+    if (batch_output_disabled < 0) batch_output_disabled =
+        getenv("DS4_METAL_DISABLE_V41_BATCH_ATTN_OUTPUT") != NULL;
+    const bool batch_output = g->tp_world == 1 && !batch_output_disabled;
+#else
+    const bool batch_output = false;
+#endif
     if (row_logits) {
         if (prefill_rows != rows || g->tp_world != 1 || g->streaming ||
             !g->valid || g->pos > g->ctx || rows > g->ctx - g->pos ||
@@ -41806,10 +41814,14 @@ static bool ds41_graph_step_batch_outputs(ds41_gpu_graph *const *graphs, const i
 #undef DS41_SESSION_ROW
             row.q = queries[i];
             row.heads = heads[i];
-            ok = ds41_attention(&row, model, l, il, true) &&
-                ds41_attention_output(&row, model, l, false) &&
+            ok = ds41_attention(&row, model, l, il, true);
+            if (ok && !batch_output) ok = ds41_attention_output(&row, model, l, false) &&
                 ds41_stage(il, positions[i], "batch_attn_out");
         }
+        if (ok && batch_output) ok = ds4_gpu_dsv41_attention_output_batch(
+            active.block, active.low, model->map, model->size,
+            l->attn_output_a->abs_offset, l->attn_output_b->abs_offset,
+            active.heads, rows) && ds41_stage(il, g->pos, "batch_attn_out");
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, rows);
         if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
             ds41_after_attention_batch(&active, model, l, rows) &&

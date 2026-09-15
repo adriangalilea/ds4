@@ -890,9 +890,10 @@ static int check_sparse_gather(void) {
     return 1;
 }
 
-static int check_attention_output(bool large) {
+static int check_attention_output(int mode) {
     enum { GROUP = 4096, RANK = 1024, GROUPS = 8, OUT = 5120 };
-    const uint32_t ROWS = large ? 8192u : 513u;
+    const bool exact = mode == 2;
+    const uint32_t ROWS = exact ? 8u : mode == 1 ? 8192u : 513u;
     typedef struct { uint16_t d; int8_t qs[32]; } q8_block;
     const uint64_t a_bytes = (uint64_t)GROUPS * RANK * GROUP / 32 * sizeof(q8_block);
     const uint64_t b_bytes = (uint64_t)OUT * GROUPS * RANK / 32 * sizeof(q8_block);
@@ -903,11 +904,13 @@ static int check_attention_output(bool large) {
     q8_block *w = model;
     for (uint64_t i = 0; i < (a_bytes + b_bytes) / sizeof(*w); i++) {
         w[i].d = 0x2000; /* Exact 1/128 scale and binary-fraction inputs. */
+        if (exact) w[i].d += (uint16_t)(i % 0x800);
         for (int j = 0; j < 32; j++) w[i].qs[j] = (int)(random_value() * 8192) % 8;
     }
     float *x = malloc(xb), *reference = malloc(ob), *reference_low = malloc(lb);
     CHECK(x && reference && reference_low);
     for (uint64_t i = 0; i < xb / 4; i++) x[i] = (int)(random_value() * 8192) % 51 / 256.0f;
+    if (exact) for (uint64_t i = 0; i < xb / 4; i++) x[i] = random_value() / 3.0f;
     ds4_gpu_tensor *xt = upload(x, xb), *low = upload(NULL, lb), *out = upload(NULL, ob);
     CHECK(xt && low && out && ds4_gpu_set_model_map(model, a_bytes + b_bytes));
     CHECK(ds4_gpu_begin_commands());
@@ -928,7 +931,7 @@ static int check_attention_output(bool large) {
     CHECK(ds4_gpu_end_commands());
     CHECK(ds4_gpu_tensor_read(out, 0, reference, ob));
     CHECK(ds4_gpu_tensor_read(low, 0, reference_low, lb));
-    const uint32_t sizes[] = {31, 32, 63, 64, 65, 257, 512, 513, 8191, 8192};
+    const uint32_t sizes[] = {1, 2, 3, 4, 5, 6, 7, 8, 31, 32, 63, 64, 65, 257, 512, 513, 8191, 8192};
     for (unsigned n = 0; n < sizeof(sizes) / sizeof(*sizes); n++) {
         const uint32_t rows = sizes[n];
         if (rows > ROWS) break;
@@ -939,6 +942,7 @@ static int check_attention_output(bool large) {
         const float *got = ds4_gpu_tensor_contents(out);
         const float *got_low = ds4_gpu_tensor_contents(low);
         CHECK(!memcmp(got_low, reference_low, (uint64_t)rows * GROUPS * RANK * 4));
+        if (exact) CHECK(!memcmp(got, reference, (uint64_t)rows * OUT * 4));
         for (uint64_t i = 0; i < (uint64_t)rows * OUT; i++) {
             if (!isfinite(got[i]) || fabsf(got[i] - reference[i]) > 2e-5f * (1 + fabsf(reference[i])))
                 fprintf(stderr, "attention output rows=%u index=%llu actual=%.9g reference=%.9g\n",
@@ -957,7 +961,7 @@ static int check_attention_output(bool large) {
     CHECK(packed && partial[0] && partial[1]);
     const uint32_t tp_sizes[] = {1, 31, 32, 33, 63, 64, 65, 127, 128, 129, 257, 512, 513};
     const uint32_t q_half = GROUPS / 2 * GROUP, low_half = GROUPS / 2 * RANK;
-    for (size_t n = 0; n < sizeof(tp_sizes) / sizeof(*tp_sizes); n++) {
+    for (size_t n = 0; !exact && n < sizeof(tp_sizes) / sizeof(*tp_sizes); n++) {
         const uint32_t rows = tp_sizes[n];
         for (uint32_t rank = 0; rank < 2; rank++) {
             float *px = ds4_gpu_tensor_contents(packed);
@@ -1583,6 +1587,13 @@ static int check_tp_attention(void) {
 }
 
 int main(int argc, char **argv) {
+#ifdef __APPLE__
+    if (argc == 2 && !strcmp(argv[1], "--attention-output-exact")) {
+        const int ok = ds4_gpu_init() && check_attention_output(2);
+        ds4_gpu_cleanup();
+        return ok ? 0 : 1;
+    }
+#endif
     if (argc == 2 && !strcmp(argv[1], "--embedding")) {
         const int ok = ds4_gpu_init() && check_embedding();
         ds4_gpu_cleanup();
