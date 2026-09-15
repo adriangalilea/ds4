@@ -4626,6 +4626,66 @@ kernel void kernel_mul_mv_id_mxfp4_pair_swiglu_f32(
     (void)tiitg;
 }
 
+kernel void kernel_moe_tiny_expert_members(
+        constant ds4_metal_args_mul_mv_id &args,
+        device const char *ids,
+        device uint *members,
+        uint pair [[thread_position_in_grid]]) {
+    const uint pairs = args.nei0 * args.nei1;
+    if (pair >= pairs) return;
+    device uint *list = members + pair * (pairs + 1);
+    list[0] = 0;
+    const int expert = ((device const int *)(ids + (pair / args.nei0) * args.nbi1))[pair % args.nei0];
+    for (uint i = 0; i < pair; ++i) {
+        if (((device const int *)(ids + (i / args.nei0) * args.nbi1))[i % args.nei0] == expert) return;
+    }
+    uint count = 0;
+    for (uint i = pair; i < pairs; ++i) {
+        if (((device const int *)(ids + (i / args.nei0) * args.nbi1))[i % args.nei0] == expert) {
+            list[++count] = i;
+        }
+    }
+    list[0] = count;
+}
+
+kernel void kernel_mul_mv_id_mxfp4_pair_swiglu_expert_members_f32(
+        constant ds4_metal_args_mul_mv_id &args,
+        constant ds4_metal_dsv4_moe_swiglu_weight_args &act,
+        device const char *src0_gate,
+        device const char *src0_up,
+        device const char *src1,
+        device char *dst_gate,
+        device char *dst_up,
+        device char *dst_mid,
+        device const char *ids,
+        device const char *weights,
+        device const uint *members,
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    device const uint *list = members + tgpig.z * (args.nei0 * args.nei1 + 1);
+    const uint count = list[0];
+    if (!count) return;
+    const uint leader = tgpig.z;
+    const int expert = ((device const int *)(ids + (leader / args.nei0) * args.nbi1))[leader % args.nei0];
+    device const char *gate_expert = src0_gate + (int64_t)(expert - args.tp_expert_base) * args.nb02;
+    device const char *up_expert = src0_up + (int64_t)(expert - args.tp_expert_base) * args.nb02;
+    tgpig.z = 0;
+    for (uint i = 1; i <= count; ++i) {
+        const uint pair = list[i];
+        const uint token = pair / args.nei0;
+        const uint slot = pair % args.nei0;
+        device const char *x = src1 + (slot % args.ne11) * args.nb11 + token * args.nb12;
+        const float weight = *(device const float *)(weights + pair * act.weight_stride);
+        kernel_mul_mv_mxfp4_pair_swiglu_impl(args, act, gate_expert, up_expert, x,
+            dst_gate + pair * args.ne0 * sizeof(float),
+            dst_up + pair * args.ne0 * sizeof(float),
+            dst_mid + pair * act.mid_row_stride, weight, shmem, tgpig, tiisg, sgitg);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 kernel void kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_f32(
         constant ds4_metal_args_mul_mv_id &args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args &act,

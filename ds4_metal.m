@@ -32022,7 +32022,8 @@ static int ds4_gpu_encode_mul_mv_id_pair_swiglu(
         NSUInteger                  weights_off,
         NSUInteger                  threadgroup_bytes,
         NSUInteger                  nsg,
-        bool                        rows_per_group_is_nr0) {
+        bool                        rows_per_group_is_nr0,
+        id<MTLBuffer>               expert_members) {
     if (!cb || !pipeline || !args || !act ||
         !src0_a || !src0_b || !src1 || !dst_a || !dst_b || !dst_mid || !ids || !weights ||
         args->ne00 <= 0 || args->ne01 <= 0 || args->nei0 <= 0 || args->nei1 <= 0) {
@@ -32046,6 +32047,7 @@ static int ds4_gpu_encode_mul_mv_id_pair_swiglu(
     [enc setBuffer:dst_mid offset:dst_mid_off atIndex:7];
     [enc setBuffer:ids     offset:ids_off     atIndex:8];
     [enc setBuffer:weights offset:weights_off atIndex:9];
+    if (expert_members) [enc setBuffer:expert_members offset:0 atIndex:10];
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
@@ -42780,7 +42782,7 @@ int ds4_gpu_routed_moe_one_tensor(
                                                         ds4_gpu_tensor_offset(weights),
                                                         gate_smem,
                                                         pair_swiglu_nsg,
-                                                        false);
+                                                        false, nil);
         } else if (!g_quality_mode &&
                    gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
                    g_moe_mul_mv_id_iq2_xxs_pair_pipeline) {
@@ -44259,6 +44261,29 @@ int ds4_gpu_routed_moe_batch_tensor(
                 selectedbuf, ds4_gpu_tensor_offset(selected), gate_smem, gate_nsg,
                 gate_rows_per_group_is_nr0, 1, stream_overflow_up);
         } else if (use_tiny_pair_swiglu) {
+            id<MTLBuffer> expert_members = nil;
+            if (v41_decode_batch && n_tokens >= 2 && g_tp_split_world <= 1 &&
+                !g_ssd_streaming_mode && gate_type == DS4_METAL_TENSOR_MXFP4 &&
+                !getenv("DS4_METAL_DISABLE_V41_EXPERT_UNION_GATE")) {
+                id<MTLComputePipelineState> map_pipeline =
+                    ds4_gpu_get_mul_mv_pipeline("kernel_moe_tiny_expert_members", 2);
+                id<MTLComputePipelineState> union_pipeline = ds4_gpu_get_mul_mv_pipeline(
+                    "kernel_mul_mv_id_mxfp4_pair_swiglu_expert_members_f32", 2);
+                const uint64_t map_bytes = (uint64_t)pair_rows * (pair_rows + 1) * sizeof(uint32_t);
+                if (!map_pipeline || !union_pipeline ||
+                    !ds4_gpu_ensure_scratch_buffer(&g_moe_id_map_buffer,
+                        &g_moe_id_map_bytes, map_bytes, "tiny expert members")) return 0;
+                expert_members = g_moe_id_map_buffer;
+                id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+                [enc setComputePipelineState:map_pipeline];
+                [enc setBytes:&gate_args length:sizeof(gate_args) atIndex:0];
+                [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:1];
+                [enc setBuffer:expert_members offset:0 atIndex:2];
+                [enc dispatchThreads:MTLSizeMake(pair_rows, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                ds4_gpu_end_compute_encoder(cb, enc);
+                tiny_pair_swiglu_pipeline = union_pipeline;
+            }
             ds4_gpu_dsv4_moe_swiglu_weight_args act_args = {
                 .width = expert_mid_dim,
                 .rows = pair_rows,
@@ -44291,7 +44316,7 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                        ds4_gpu_tensor_offset(weights),
                                                        gate_smem,
                                                        use_tp_mxfp4_static_batch ? 1 : 2,
-                                                       false);
+                                                       false, expert_members);
         } else if (use_tiny_pair_mv) {
             id<MTLComputePipelineState> pair_pipeline =
                 gate_type == DS4_METAL_TENSOR_IQ2_XXS ?
