@@ -22,15 +22,19 @@ static uint32_t random_u32(void) {
 }
 static uint64_t aligned(uint64_t n, uint64_t page) { return (n + page - 1) / page * page; }
 
-static void diagnose_lane_zero(const uint8_t *matrix, const float *x, float expected) {
+static void diagnose_lane_zero(const uint8_t *matrix, const float *x, const float *expected) {
     const float lut[] = {0,.5f,1,1.5f,2,3,4,6,0,-.5f,-1,-1.5f,-2,-3,-4,-6};
+    unsigned best = 0;
     for (unsigned a = 0; a < 4; ++a) for (unsigned b = 0; b < 4; ++b)
     for (unsigned c = 0; c < 4; ++c) for (unsigned d = 0; d < 4; ++d) {
         if (a == b || a == c || a == d || b == c || b == d || c == d) continue;
         for (unsigned balanced = 0; balanced < 2; ++balanced) {
+            unsigned matched = 0;
+            for (unsigned row = 0; row < F; ++row) {
+            const uint8_t *blocks = matrix + (uint64_t)row * (D/32*17);
             float sum = 0;
             for (unsigned ib = 0; ib < D/32; ib += 16) {
-                const uint8_t *q = matrix + ib*17 + 1;
+                const uint8_t *q = blocks + ib*17 + 1;
                 float v[4];
                 for (unsigned i = 0; i < 4; ++i) {
                     v[i] = x[ib*32+i] * lut[q[i]&15];
@@ -39,9 +43,15 @@ static void diagnose_lane_zero(const uint8_t *matrix, const float *x, float expe
                     v[i] += x[ib*32+20+i] * lut[q[4+i]>>4];
                 }
                 float dot = balanced ? (v[a]+v[b])+(v[c]+v[d]) : ((v[a]+v[b])+v[c])+v[d];
-                sum += ldexpf(dot, (int)matrix[ib*17]-127);
+                sum += ldexpf(dot, (int)blocks[ib*17]-127);
             }
-            if (sum == expected) fprintf(stderr, "CPU_MATCH order=%u%u%u%u balanced=%u value=%a\n", a,b,c,d,balanced,sum);
+            if (memcmp(&sum, expected + row, sizeof(float))) break;
+            ++matched;
+            }
+            if (matched >= best) {
+                best = matched;
+                fprintf(stderr, "CPU_MATCH_PREFIX order=%u%u%u%u balanced=%u matched=%u/%u\n", a,b,c,d,balanced,matched,F);
+            }
         }
     }
 }
@@ -134,9 +144,9 @@ int main(void) {
                                     fprintf(stderr, "MISMATCH rows=%u pattern=%u clipped=%u variant=%u tensor=%u index=%llu ref=%a got=%a\n",
                                         rows, pattern, clipped, variant, j, (unsigned long long)i, reference[j][i], actual[j][i]);
                                     if (lane_zero && j == 0) {
-                                        const unsigned pair = i / F, row_index = i % F;
-                                        diagnose_lane_zero(model + (uint64_t)ids[pair]*expert + row_index*row,
-                                            x + (pair/K)*D, reference[j][i]);
+                                        const unsigned pair = i / F;
+                                        diagnose_lane_zero(model + (uint64_t)ids[pair]*expert,
+                                            x + (pair/K)*D, reference[j] + pair*F);
                                     }
                                     break;
                                 }
