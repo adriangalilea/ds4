@@ -4674,6 +4674,7 @@ static inline void ds4_mxfp4_gate_up_two_members(
     device const block_mxfp4 *xu = (device const block_mxfp4 *)(up_expert + first_row * args.nb01);
     float sumg[2][N_R0_MXFP4] = {{0.f}};
     float sumu[2][N_R0_MXFP4] = {{0.f}};
+#pragma clang loop vectorize(disable) interleave(disable) unroll(disable)
     for (int ib = ix; ib < nb; ib += 16) {
         FOR_UNROLL (short row = 0; row < N_R0_MXFP4; ++row) {
             device const block_mxfp4 &bg = xg[row * row_blocks + ib];
