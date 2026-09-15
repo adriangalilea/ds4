@@ -102,7 +102,13 @@ int main(void) {
                         for (uint64_t i = used; i < capacity[j]+32; ++i) CHECK(actual[j][i] == -12345.f);
                         if (!variant) memcpy(reference[j], actual[j], used*sizeof(float));
                         else if (memcmp(reference[j], actual[j], used*sizeof(float))) {
-                            fprintf(stderr, "MISMATCH rows=%u pattern=%u clipped=%u tensor=%u\n", rows, pattern, clipped, j);
+                            for (uint64_t i = 0; i < used; ++i) {
+                                if (memcmp(reference[j] + i, actual[j] + i, sizeof(float))) {
+                                    fprintf(stderr, "MISMATCH rows=%u pattern=%u clipped=%u variant=%u tensor=%u index=%llu ref=%a got=%a\n",
+                                        rows, pattern, clipped, variant, j, (unsigned long long)i, reference[j][i], actual[j][i]);
+                                    break;
+                                }
+                            }
                             return 1;
                         }
                     }
