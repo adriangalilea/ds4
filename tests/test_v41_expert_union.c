@@ -22,36 +22,42 @@ static uint32_t random_u32(void) {
 }
 static uint64_t aligned(uint64_t n, uint64_t page) { return (n + page - 1) / page * page; }
 
+static float sum_four(const float v[4], const unsigned order[4], unsigned balanced) {
+    return balanced ? (v[order[0]]+v[order[1]])+(v[order[2]]+v[order[3]]) :
+        ((v[order[0]]+v[order[1]])+v[order[2]])+v[order[3]];
+}
+
 static void diagnose_lane_zero(const uint8_t *matrix, const float *x, const float *expected) {
     const float lut[] = {0,.5f,1,1.5f,2,3,4,6,0,-.5f,-1,-1.5f,-2,-3,-4,-6};
-    unsigned best = 0;
+    unsigned orders[24][4], count = 0, best = 0;
     for (unsigned a = 0; a < 4; ++a) for (unsigned b = 0; b < 4; ++b)
     for (unsigned c = 0; c < 4; ++c) for (unsigned d = 0; d < 4; ++d) {
         if (a == b || a == c || a == d || b == c || b == d || c == d) continue;
-        for (unsigned balanced = 0; balanced < 2; ++balanced) {
-            unsigned matched = 0;
-            for (unsigned row = 0; row < F; ++row) {
+        orders[count][0]=a; orders[count][1]=b; orders[count][2]=c; orders[count++][3]=d;
+    }
+    for (unsigned ag = 0; ag < 48; ++ag) for (unsigned dot = 0; dot < 48; ++dot) {
+        unsigned matched = 0;
+        for (unsigned row = 0; row < F; ++row) {
             const uint8_t *blocks = matrix + (uint64_t)row * (D/32*17);
             float sum = 0;
             for (unsigned ib = 0; ib < D/32; ib += 16) {
                 const uint8_t *q = blocks + ib*17 + 1;
                 float v[4];
                 for (unsigned i = 0; i < 4; ++i) {
-                    v[i] = x[ib*32+i] * lut[q[i]&15];
-                    v[i] += x[ib*32+16+i] * lut[q[i]>>4];
-                    v[i] += x[ib*32+4+i] * lut[q[4+i]&15];
-                    v[i] += x[ib*32+20+i] * lut[q[4+i]>>4];
+                    const float terms[] = {x[ib*32+i]*lut[q[i]&15], x[ib*32+16+i]*lut[q[i]>>4],
+                        x[ib*32+4+i]*lut[q[4+i]&15], x[ib*32+20+i]*lut[q[4+i]>>4]};
+                    v[i] = sum_four(terms, orders[ag/2], ag%2);
                 }
-                float dot = balanced ? (v[a]+v[b])+(v[c]+v[d]) : ((v[a]+v[b])+v[c])+v[d];
-                sum += ldexpf(dot, (int)blocks[ib*17]-127);
+                sum += ldexpf(sum_four(v, orders[dot/2], dot%2), (int)blocks[ib*17]-127);
             }
             if (memcmp(&sum, expected + row, sizeof(float))) break;
             ++matched;
-            }
-            if (matched >= best) {
-                best = matched;
-                fprintf(stderr, "CPU_MATCH_PREFIX order=%u%u%u%u balanced=%u matched=%u/%u\n", a,b,c,d,balanced,matched,F);
-            }
+        }
+        if (matched > best || matched == F) {
+            best = matched;
+            const unsigned *a = orders[ag/2], *d = orders[dot/2];
+            fprintf(stderr, "CPU_MATCH_PREFIX ag=%u%u%u%u/%u dot=%u%u%u%u/%u matched=%u/%u\n",
+                a[0],a[1],a[2],a[3],ag%2,d[0],d[1],d[2],d[3],dot%2,matched,F);
         }
     }
 }
