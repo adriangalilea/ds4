@@ -32047,7 +32047,11 @@ static int ds4_gpu_encode_mul_mv_id_pair_swiglu(
     [enc setBuffer:dst_mid offset:dst_mid_off atIndex:7];
     [enc setBuffer:ids     offset:ids_off     atIndex:8];
     [enc setBuffer:weights offset:weights_off atIndex:9];
-    if (expert_members) [enc setBuffer:expert_members offset:0 atIndex:10];
+    if (expert_members) {
+        const uint32_t pair_reuse = !getenv("DS4_METAL_DISABLE_V41_EXPERT_PAIR_REUSE");
+        [enc setBuffer:expert_members offset:0 atIndex:10];
+        [enc setBytes:&pair_reuse length:sizeof(pair_reuse) atIndex:11];
+    }
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }

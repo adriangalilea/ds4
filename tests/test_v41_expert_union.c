@@ -78,9 +78,11 @@ int main(void) {
             }
             CHECK(ds4_gpu_tensor_write(it, 0, ids, rows*K*sizeof(int32_t)));
             for (unsigned clipped = 0; clipped < 2; ++clipped) {
-                for (unsigned variant = 0; variant < 2; ++variant) {
+                for (unsigned variant = 0; variant < 3; ++variant) {
                     if (variant) unsetenv("DS4_METAL_DISABLE_V41_EXPERT_UNION_GATE");
                     else setenv("DS4_METAL_DISABLE_V41_EXPERT_UNION_GATE", "1", 1);
+                    if (variant == 1) setenv("DS4_METAL_DISABLE_V41_EXPERT_PAIR_REUSE", "1", 1);
+                    else unsetenv("DS4_METAL_DISABLE_V41_EXPERT_PAIR_REUSE");
                     for (unsigned j = 0; j < 4; ++j) {
                         for (uint64_t i = 0; i < capacity[j] + 32; ++i) actual[j][i] = -12345.f;
                         CHECK(ds4_gpu_tensor_write(t[j], 0, actual[j], (capacity[j]+32)*sizeof(float)));
