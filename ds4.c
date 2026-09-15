@@ -41790,12 +41790,14 @@ static bool ds41_graph_step_batch_outputs(ds41_gpu_graph *const *graphs, const i
             }
         }
         if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows);
+        if (ok) ok = ds41_stage(il, g->pos, "batch_pre_attn");
         for (int i = 0; ok && i < count; i++)
             ok = ds41_dspark_capture_rows(graphs[i]->dspark_capture, il,
                                            g->rows_view[i].residual, positions[i], 1) &&
                 ds41_dspark_observe_inputs(graphs[i]->dspark_capture, il,
                                            g->rows_view[i].x, g->rows_view[i].norm, positions[i], 1);
         if (ok) ok = ds41_attention_project_batch(g, model, l, rows);
+        if (ok) ok = ds41_stage(il, g->pos, "batch_attn_project");
         for (int i = 0; ok && i < count; i++) {
             ds41_gpu_graph row = *graphs[i];
             row.pos = positions[i];
@@ -41805,19 +41807,23 @@ static bool ds41_graph_step_batch_outputs(ds41_gpu_graph *const *graphs, const i
             row.q = queries[i];
             row.heads = heads[i];
             ok = ds41_attention(&row, model, l, il, true) &&
-                ds41_attention_output(&row, model, l, false);
+                ds41_attention_output(&row, model, l, false) &&
+                ds41_stage(il, positions[i], "batch_attn_out");
         }
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, rows);
         if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
             ds41_after_attention_batch(&active, model, l, rows) &&
+            ds41_stage(il, g->pos, "batch_post_attn") &&
             ds41_moe_batch(g, model, l, il, rows, shared_owner) &&
+            ds41_stage(il, g->pos, "batch_moe") &&
             (shared_owner ? ds4_gpu_tensor_copy(active.block, 0, active.routed, 0,
                 (uint64_t)rows * DS4_N_EMBD * sizeof(float)) :
                 ds4_gpu_add_tensor(active.block, active.routed, active.shared, rows * DS4_N_EMBD)) &&
             ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
             ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
                 active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
-            ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16);
+            ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16) &&
+            ds41_stage(il, g->pos, "batch_after_moe");
         /* The second Engram upload reuses the first one's input storage. */
         if (ok && il == 13) ok = ds4_gpu_end_commands() && ds4_gpu_begin_commands();
     }
@@ -41860,6 +41866,7 @@ static bool ds41_graph_step_batch_outputs(ds41_gpu_graph *const *graphs, const i
         if (ok) { s->history = history[i]; s->pos = positions[i] + 1u; }
     }
     ds4_gpu_tensor_free(batch_logits);
+    if (ok) ok = ds41_stage(DS4_N_LAYER, g->pos, "batch_logits");
     if (!ok) fprintf(stderr, "ds4: V4.1 session batch failed at layer %u (%d rows)\n", il, count);
 #define DS41_SESSION_FREE(name, width) ds4_gpu_tensor_free(active.name);
     DS41_PREFILL_ROWS(DS41_SESSION_FREE)

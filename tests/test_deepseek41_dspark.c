@@ -536,7 +536,68 @@ done:
     return rc;
 }
 
+/* Exercise the public serving API with independent session state. */
+static int bench_sessions(const char *target_path, const char *code_path,
+                           const char *english_path, int count) {
+    int rc = 1;
+    ds4_engine *engine = NULL;
+    ds4_session *sessions[6] = {0};
+    ds4_decode_item items[6] = {0};
+    ds4_tokens prompts[2] = {{0}};
+    char *text[2] = {0}, err[256] = {0};
+    size_t bytes[2];
+    int emitted[6][256];
+    ds4_engine_options opt = {.model_path = target_path,
+        .backend = DS4_BACKEND_METAL, .context_size = 32768, .power_percent = 100};
+    CHECK(count == 1 || count == 2 || count == 4 || count == 6);
+    CHECK(imatrix_read_text_file(code_path, &text[0], &bytes[0]));
+    CHECK(imatrix_read_text_file(english_path, &text[1], &bytes[1]));
+    CHECK(ds4_engine_open(&engine, &opt) == 0);
+    for (int i = 0; i < 2; i++)
+        ds4_encode_chat_prompt(engine, NULL, text[i], DS4_THINK_NONE, &prompts[i]);
+    for (int i = 0; i < count; i++) {
+        CHECK(ds4_session_create(&sessions[i], engine, 32768) == 0);
+        CHECK(ds4_session_sync(sessions[i], &prompts[i % 2], err, sizeof(err)) == 0);
+        items[i].session = sessions[i];
+    }
+    if (count > 1) CHECK(ds41_sessions_batch_supported(items, count, engine));
+    fprintf(stderr, "SESSION_PATH count=%d native_ds41=%d prompts=%d,%d\n",
+            count, count > 1, prompts[0].len, prompts[1].len);
+    double total_ms = 0;
+    for (int step = 0; step < 256; step++) {
+        for (int i = 0; i < count; i++) {
+            items[i].token = sample_argmax(sessions[i]->logits, DS4_N_VOCAB);
+            CHECK(!vocab_token_is_generation_stop(&engine->vocab, items[i].token));
+            emitted[i][step] = items[i].token;
+        }
+        const double t0 = now_sec();
+        CHECK(ds4_sessions_eval_batch(items, count, err, sizeof(err)) == 0);
+        const double ms = (now_sec() - t0) * 1000;
+        if (step >= 16) total_ms += ms;
+        fprintf(stderr, "SESSION_STEP step=%d count=%d ms=%.6f\n", step, count, ms);
+        if (metal_graph_gpu_stage_timestamps())
+            ds4_gpu_stage_report("sessions", (uint32_t)step, (uint32_t)count);
+    }
+    for (int i = 0; i < count; i++) {
+        printf("session=%d tokens=", i);
+        for (int j = 0; j < 256; j++) printf("%s%d", j ? "," : "", emitted[i][j]);
+        putchar('\n');
+    }
+    fprintf(stderr, "SESSION_RESULT count=%d measured_steps=240 mean_ms=%.6f aggregate_tps=%.6f\n",
+            count, total_ms / 240, count * 240000.0 / total_ms);
+    rc = 0;
+done:
+    if (rc) fprintf(stderr, "session benchmark failed: %s\n", err);
+    if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
+    for (int i = 0; i < 6; i++) ds4_session_free(sessions[i]);
+    for (int i = 0; i < 2; i++) { ds4_tokens_free(&prompts[i]); free(text[i]); }
+    ds4_engine_close(engine);
+    return rc;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 6 && !strcmp(argv[1], "--sessions"))
+        return bench_sessions(argv[2], argv[3], argv[4], atoi(argv[5]));
     if (argc == 5 && !strcmp(argv[1], "--verify-rows"))
         return check_verify_rows(argv[2], argv[3], (uint32_t)atoi(argv[4]));
     if (argc == 8 && !strcmp(argv[1], "--replay")) return replay_taps(argv);
