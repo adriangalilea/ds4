@@ -56,13 +56,14 @@ int main(void) {
     ds4_gpu_tensor *wt = ds4_gpu_tensor_alloc(sizeof(weights));
     ds4_gpu_tensor *t[4];
     uint64_t capacity[4] = {R*K*F, R*K*F, R*K*F, R*D};
-    float *reference[4], *actual[4];
+    float *reference[4], *actual[4], *paired[4];
     CHECK(xt && it && wt);
     for (unsigned j = 0; j < 4; ++j) {
         t[j] = ds4_gpu_tensor_alloc((capacity[j] + 32) * sizeof(float));
         reference[j] = malloc((capacity[j] + 32) * sizeof(float));
         actual[j] = malloc((capacity[j] + 32) * sizeof(float));
-        CHECK(t[j] && reference[j] && actual[j]);
+        paired[j] = malloc((capacity[j] + 32) * sizeof(float));
+        CHECK(t[j] && reference[j] && actual[j] && paired[j]);
     }
     ds4_gpu_tensor *scratch = ds4_gpu_tensor_alloc(R*K*D*sizeof(float));
     CHECK(scratch && ds4_gpu_tensor_write(xt, 0, x, sizeof(x)) &&
@@ -80,7 +81,7 @@ int main(void) {
             }
             CHECK(ds4_gpu_tensor_write(it, 0, ids, rows*K*sizeof(int32_t)));
             for (unsigned clipped = 0; clipped < 2; ++clipped) {
-                for (unsigned variant = 0; variant < 3; ++variant) {
+                for (unsigned variant = 0; variant < 4; ++variant) {
                     if (variant) unsetenv("DS4_METAL_DISABLE_V41_EXPERT_UNION_GATE");
                     else setenv("DS4_METAL_DISABLE_V41_EXPERT_UNION_GATE", "1", 1);
                     if (variant == 1) setenv("DS4_METAL_DISABLE_V41_EXPERT_PAIR_REUSE", "1", 1);
@@ -101,18 +102,38 @@ int main(void) {
                         for (uint64_t i = 0; i < used; ++i) CHECK(isfinite(actual[j][i]));
                         for (uint64_t i = used; i < capacity[j]+32; ++i) CHECK(actual[j][i] == -12345.f);
                         if (!variant) memcpy(reference[j], actual[j], used*sizeof(float));
-                        else if (memcmp(reference[j], actual[j], used*sizeof(float))) {
+                        else if (variant == 1 && memcmp(reference[j], actual[j], used*sizeof(float))) {
                             fprintf(stderr, "MISMATCH rows=%u pattern=%u clipped=%u tensor=%u\n", rows, pattern, clipped, j);
                             return 1;
+                        } else if (variant == 2) {
+                            double err2 = 0, ref2 = 0, total = 0, maxerr = 0, maxref = 0;
+                            for (uint64_t i = 0; i < used; ++i) {
+                                const double delta = fabs((double)actual[j][i] - reference[j][i]);
+                                err2 += delta * delta;
+                                ref2 += (double)reference[j][i] * reference[j][i];
+                                total += delta;
+                                maxerr = fmax(maxerr, delta);
+                                maxref = fmax(maxref, fabs(reference[j][i]));
+                            }
+                            const double relative_l2 = sqrt(err2 / fmax(ref2, 1e-30));
+                            const double relative_max = maxerr / fmax(maxref, 1e-30);
+                            fprintf(stderr, "NUMERICAL rows=%u pattern=%u clamp=%u tensor=%u max_abs=%.9g mean_abs=%.9g relative_l2=%.9g relative_max=%.9g\n",
+                                    rows, pattern, clipped, j, maxerr, total / used, relative_l2, relative_max);
+                            /* Normwise bounds include cancellation near zero. */
+                            CHECK(relative_l2 <= 1e-5 && relative_max <= 1e-5);
+                            if (rows < 4) CHECK(!memcmp(reference[j], actual[j], used*sizeof(float)));
+                            memcpy(paired[j], actual[j], used*sizeof(float));
+                        } else if (variant == 3) {
+                            CHECK(!memcmp(paired[j], actual[j], used*sizeof(float)));
                         }
                     }
                 }
-                fprintf(stderr, "EXACT expert union rows=%u pattern=%u clamp=%u gate/up/mid/out\n", rows, pattern, clipped);
+                fprintf(stderr, "PASS expert union rows=%u pattern=%u clamp=%u grouped_exact=1 paired_repeat_exact=1\n", rows, pattern, clipped);
             }
         }
     }
     for (unsigned j = 0; j < 4; ++j) {
-        ds4_gpu_tensor_free(t[j]); free(reference[j]); free(actual[j]);
+        ds4_gpu_tensor_free(t[j]); free(reference[j]); free(actual[j]); free(paired[j]);
     }
     ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(it); ds4_gpu_tensor_free(wt);
     ds4_gpu_tensor_free(scratch);

@@ -536,6 +536,116 @@ done:
     return rc;
 }
 
+static bool numerical_logits(const float *reference, const float *candidate,
+                              unsigned step, unsigned session, const char *comparison) {
+    const int want = sample_argmax(reference, DS4_N_VOCAB);
+    const int got = sample_argmax(candidate, DS4_N_VOCAB);
+    double sum = 0, sum2 = 0, maximum = 0;
+    float runner_up = -INFINITY, candidate_runner_up = -INFINITY;
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+        if (!isfinite(reference[i]) || !isfinite(candidate[i])) return false;
+        const double error = fabs((double)reference[i] - candidate[i]);
+        maximum = fmax(maximum, error);
+        sum += error;
+        sum2 += error * error;
+        if ((int)i != want) runner_up = fmaxf(runner_up, reference[i]);
+        if ((int)i != got) candidate_runner_up = fmaxf(candidate_runner_up, candidate[i]);
+    }
+    printf("LOGITS step=%u session=%u comparison=%s max_abs=%.9g mean_abs=%.9g rms=%.9g expected=%d actual=%d margin=%.9g candidate_margin=%.9g winner_gap=%.9g exact=%d\n",
+           step, session, comparison, maximum, sum / DS4_N_VOCAB,
+           sqrt(sum2 / DS4_N_VOCAB), want, got,
+           (double)reference[want] - runner_up,
+           (double)candidate[got] - candidate_runner_up,
+           (double)reference[want] - reference[got],
+           !memcmp(reference, candidate, (size_t)DS4_N_VOCAB * sizeof(float)));
+    return true;
+}
+
+/* Feed every path the scalar continuation, including after a disagreement.
+ * The binary stream permits a byte comparison across independent repeats. */
+static int numerical_sessions(char **argv) {
+    int rc = 1;
+    ds4_engine *engine = NULL;
+    ds4_session *scalar[3] = {0}, *batch[2][6] = {{0}};
+    ds4_decode_item items[6] = {0};
+    ds4_tokens prompts[3] = {{0}};
+    char *text[3] = {0}, err[256] = {0};
+    FILE *raw = NULL;
+    const ds4_engine_options opt = {.model_path = argv[2],
+        .backend = DS4_BACKEND_METAL, .context_size = 32768, .power_percent = 100};
+    CHECK(ds4_engine_open(&engine, &opt) == 0);
+    CHECK(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41);
+    CHECK(!getenv("DS4_METAL_DISABLE_V41_EXPERT_UNION_GATE"));
+    CHECK(setenv("DS4_METAL_DISABLE_V41_EXPERT_PAIR_REUSE", "1", 1) == 0);
+    for (int w = 0; w < 3; w++) {
+        size_t bytes = 0;
+        CHECK(imatrix_read_text_file(argv[3+w], &text[w], &bytes) && bytes);
+        ds4_encode_chat_prompt(engine, NULL, text[w], DS4_THINK_NONE, &prompts[w]);
+        CHECK(prompts[w].len > 1 && prompts[w].len + 256 < 32768);
+        CHECK(ds4_session_create(&scalar[w], engine, 32768) == 0);
+        CHECK(ds4_session_sync(scalar[w], &prompts[w], err, sizeof(err)) == 0);
+        fprintf(stderr, "NUMERICAL_PREFILL scalar=%d tokens=%d\n", w, prompts[w].len);
+    }
+    const size_t row_bytes = (size_t)DS4_N_VOCAB * sizeof(float);
+    for (int variant = 0; variant < 2; variant++) {
+        for (int i = 0; i < 6; i++) {
+            CHECK(ds4_session_create(&batch[variant][i], engine, 32768) == 0);
+            CHECK(ds4_session_sync(batch[variant][i], &prompts[i%3], err, sizeof(err)) == 0);
+            CHECK(!memcmp(scalar[i%3]->logits, batch[variant][i]->logits, row_bytes));
+            fprintf(stderr, "NUMERICAL_PREFILL variant=%d session=%d\n", variant, i);
+        }
+    }
+    raw = fopen(argv[6], "wb");
+    CHECK(raw);
+    for (unsigned step = 0; step < 256; step++) {
+        int tokens[3];
+        for (int w = 0; w < 3; w++) {
+            tokens[w] = sample_argmax(scalar[w]->logits, DS4_N_VOCAB);
+            CHECK(!vocab_token_is_generation_stop(&engine->vocab, tokens[w]));
+            ds4_decode_item item = {.session = scalar[w], .token = tokens[w]};
+            CHECK(ds4_sessions_eval_batch(&item, 1, err, sizeof(err)) == 0);
+            CHECK(fwrite(scalar[w]->logits, 1, row_bytes, raw) == row_bytes);
+            printf("TOKEN step=%u workload=%d token=%d\n", step, w, tokens[w]);
+        }
+        for (int variant = 0; variant < 2; variant++) {
+            if (variant) CHECK(unsetenv("DS4_METAL_DISABLE_V41_EXPERT_PAIR_REUSE") == 0);
+            else CHECK(setenv("DS4_METAL_DISABLE_V41_EXPERT_PAIR_REUSE", "1", 1) == 0);
+            for (int i = 0; i < 6; i++) {
+                items[i].session = batch[variant][i];
+                items[i].token = tokens[i%3];
+            }
+            CHECK(ds41_sessions_batch_supported(items, 6, engine));
+            CHECK(ds4_sessions_eval_batch(items, 6, err, sizeof(err)) == 0);
+            for (int i = 0; i < 6; i++) {
+                CHECK(batch[variant][i]->ds41_graph.pos == scalar[i%3]->ds41_graph.pos);
+                CHECK(!memcmp(&batch[variant][i]->ds41_graph.history,
+                              &scalar[i%3]->ds41_graph.history,
+                              sizeof(scalar[i%3]->ds41_graph.history)));
+                CHECK(fwrite(batch[variant][i]->logits, 1, row_bytes, raw) == row_bytes);
+                CHECK(numerical_logits(scalar[i%3]->logits, batch[variant][i]->logits,
+                      step, (unsigned)i, variant ? "paired_scalar" : "grouped_scalar"));
+                if (variant) CHECK(numerical_logits(batch[0][i]->logits, batch[1][i]->logits,
+                                                    step, (unsigned)i, "paired_grouped"));
+            }
+        }
+        if (step % 16 == 0) fprintf(stderr, "NUMERICAL_STEP step=%u\n", step);
+    }
+    CHECK(fflush(raw) == 0);
+    fprintf(stderr, "NUMERICAL_COMPLETE positions=256 sessions=6 workloads=3 vocab=%u\n", DS4_N_VOCAB);
+    rc = 0;
+done:
+    if (rc) fprintf(stderr, "numerical session audit failed: %s\n", err);
+    if (raw && fclose(raw)) rc = 1;
+    if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
+    for (int variant = 0; variant < 2; variant++)
+        for (int i = 0; i < 6; i++) ds4_session_free(batch[variant][i]);
+    for (int w = 0; w < 3; w++) {
+        ds4_session_free(scalar[w]); ds4_tokens_free(&prompts[w]); free(text[w]);
+    }
+    ds4_engine_close(engine);
+    return rc;
+}
+
 /* Exercise the public serving API with independent session state. */
 static int bench_sessions(const char *target_path, const char *code_path,
                            const char *english_path, int count) {
@@ -596,6 +706,8 @@ done:
 }
 
 int main(int argc, char **argv) {
+    if (argc == 7 && !strcmp(argv[1], "--sessions-numerical"))
+        return numerical_sessions(argv);
     if (argc == 6 && !strcmp(argv[1], "--sessions"))
         return bench_sessions(argv[2], argv[3], argv[4], atoi(argv[5]));
     if (argc == 5 && !strcmp(argv[1], "--verify-rows"))
