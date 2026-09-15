@@ -168,7 +168,7 @@ tests/test_mxfp4_metal: tests/test_mxfp4_metal.o ds4_metal.o ds4_image.o
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 tests/test_v41_expert_union.o: tests/test_v41_expert_union.c ds4_gpu.h
-	$(CC) $(CFLAGS) -I. -c -o $@ $<
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
 
 tests/test_v41_expert_union: tests/test_v41_expert_union.o ds4_metal.o ds4_image.o
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)

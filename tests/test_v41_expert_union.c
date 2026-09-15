@@ -22,6 +22,30 @@ static uint32_t random_u32(void) {
 }
 static uint64_t aligned(uint64_t n, uint64_t page) { return (n + page - 1) / page * page; }
 
+static void diagnose_lane_zero(const uint8_t *matrix, const float *x, float expected) {
+    const float lut[] = {0,.5f,1,1.5f,2,3,4,6,0,-.5f,-1,-1.5f,-2,-3,-4,-6};
+    for (unsigned a = 0; a < 4; ++a) for (unsigned b = 0; b < 4; ++b)
+    for (unsigned c = 0; c < 4; ++c) for (unsigned d = 0; d < 4; ++d) {
+        if (a == b || a == c || a == d || b == c || b == d || c == d) continue;
+        for (unsigned balanced = 0; balanced < 2; ++balanced) {
+            float sum = 0;
+            for (unsigned ib = 0; ib < D/32; ib += 16) {
+                const uint8_t *q = matrix + ib*17 + 1;
+                float v[4];
+                for (unsigned i = 0; i < 4; ++i) {
+                    v[i] = x[ib*32+i] * lut[q[i]&15];
+                    v[i] += x[ib*32+16+i] * lut[q[i]>>4];
+                    v[i] += x[ib*32+4+i] * lut[q[4+i]&15];
+                    v[i] += x[ib*32+20+i] * lut[q[4+i]>>4];
+                }
+                float dot = balanced ? (v[a]+v[b])+(v[c]+v[d]) : ((v[a]+v[b])+v[c])+v[d];
+                sum += ldexpf(dot, (int)matrix[ib*17]-127);
+            }
+            if (sum == expected) fprintf(stderr, "CPU_MATCH order=%u%u%u%u balanced=%u value=%a\n", a,b,c,d,balanced,sum);
+        }
+    }
+}
+
 int main(void) {
     const uint64_t page = getpagesize(), row = D / 32 * 17, down_row = F / 32 * 17;
     const uint64_t expert = row * F, down_expert = down_row * D;
@@ -50,6 +74,9 @@ int main(void) {
     for (unsigned i = 0; i < R * D; ++i)
         x[i] = ldexpf(((int)(random_u32() % 257) - 128) / 128.f,
                      (int)(random_u32() % 25) - 12);
+    const bool lane_zero = getenv("DS4_TEST_EXPERT_LANE_ZERO") != NULL;
+    if (lane_zero) for (unsigned i = 0; i < R*D; ++i)
+        if ((i % D / 32) % 16 != 0 || (i % 32) % 16 >= 8) x[i] = 0;
     for (unsigned i = 0; i < R * K; ++i) weights[i] = (1 + random_u32() % 20) / 64.f;
     ds4_gpu_tensor *xt = ds4_gpu_tensor_alloc(sizeof(x));
     ds4_gpu_tensor *it = ds4_gpu_tensor_alloc(sizeof(ids));
@@ -106,6 +133,11 @@ int main(void) {
                                 if (memcmp(reference[j] + i, actual[j] + i, sizeof(float))) {
                                     fprintf(stderr, "MISMATCH rows=%u pattern=%u clipped=%u variant=%u tensor=%u index=%llu ref=%a got=%a\n",
                                         rows, pattern, clipped, variant, j, (unsigned long long)i, reference[j][i], actual[j][i]);
+                                    if (lane_zero && j == 0) {
+                                        const unsigned pair = i / F, row_index = i % F;
+                                        diagnose_lane_zero(model + (uint64_t)ids[pair]*expert + row_index*row,
+                                            x + (pair/K)*D, reference[j][i]);
+                                    }
                                     break;
                                 }
                             }
