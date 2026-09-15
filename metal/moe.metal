@@ -4674,7 +4674,8 @@ static inline void ds4_mxfp4_gate_up_two_members(
     device const block_mxfp4 *xu = (device const block_mxfp4 *)(up_expert + first_row * args.nb01);
     float sumg[2][N_R0_MXFP4] = {{0.f}};
     float sumu[2][N_R0_MXFP4] = {{0.f}};
-#pragma clang loop vectorize(disable) interleave(disable) unroll(disable)
+    {
+#pragma clang fp reassociate(off)
     for (int ib = ix; ib < nb; ib += 16) {
         FOR_UNROLL (short row = 0; row < N_R0_MXFP4; ++row) {
             device const block_mxfp4 &bg = xg[row * row_blocks + ib];
@@ -4701,10 +4702,11 @@ static inline void ds4_mxfp4_gate_up_two_members(
                 au += yl1 * u1;
                 au += yl2 * u2;
                 au += yl3 * u3;
-                sumg[member][row] += gs * ((ag.x + ag.y) + (ag.z + ag.w));
-                sumu[member][row] += us * ((au.x + au.y) + (au.z + au.w));
+                sumg[member][row] += gs * (((ag.x + ag.y) + ag.w) + ag.z);
+                sumu[member][row] += us * (((au.x + au.y) + au.w) + au.z);
             }
         }
+    }
     }
     FOR_UNROLL (short member = 0; member < 2; ++member) {
         const uint pair = pairs[member];
