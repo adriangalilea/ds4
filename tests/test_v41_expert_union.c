@@ -47,7 +47,9 @@ int main(void) {
     ds4_gpu_set_ssd_streaming(false);
     float x[R * D], weights[R * K];
     int32_t ids[R * K];
-    for (unsigned i = 0; i < R * D; ++i) x[i] = ((int)(random_u32() % 257) - 128) / 128.f;
+    for (unsigned i = 0; i < R * D; ++i)
+        x[i] = ldexpf(((int)(random_u32() % 257) - 128) / 128.f,
+                     (int)(random_u32() % 25) - 12);
     for (unsigned i = 0; i < R * K; ++i) weights[i] = (1 + random_u32() % 20) / 64.f;
     ds4_gpu_tensor *xt = ds4_gpu_tensor_alloc(sizeof(x));
     ds4_gpu_tensor *it = ds4_gpu_tensor_alloc(sizeof(ids));
