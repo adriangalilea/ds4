@@ -40668,6 +40668,7 @@ static bool ds41_moe_batch_experts(ds41_gpu_graph *g, const ds4_model *m,
     bool mid_f16 = false;
     return ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
         ds41_route_batch(g, m, l, count, n_expert, n_used) &&
+        ds41_stage(il, g->pos, "batch_moe_route") &&
         ((shared_owner && g->tp_rank != (il & 1u)) ||
         (ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
         ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true) &&
@@ -40675,6 +40676,7 @@ static bool ds41_moe_batch_experts(ds41_gpu_graph *g, const ds4_model *m,
             count * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
         ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16) &&
         ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true))) &&
+        ds41_stage(il, g->pos, "batch_moe_shared") &&
         (
 #ifndef __APPLE__
         g->tp_world == 2 ?
@@ -40693,6 +40695,7 @@ static bool ds41_moe_batch_experts(ds41_gpu_graph *g, const ds4_model *m,
             DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, b->selected, b->route_weights,
             n_expert, n_used, DS4_SWIGLU_CLAMP_EXP, b->norm,
             il, count, &mid_f16, true)) &&
+        ds41_stage(il, g->pos, "batch_moe_routed") &&
         (!shared_owner || g->tp_rank != (il & 1u) ||
             ds4_gpu_add_tensor(b->routed, b->routed, b->shared, count * DS4_N_EMBD)) &&
         ds41_sum_partial_batch(g, b->routed, il, count);
